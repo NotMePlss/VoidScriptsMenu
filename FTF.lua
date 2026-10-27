@@ -2456,7 +2456,6 @@ if not S.Zyon then
 	S.Zyon = {
 		Connections = {},
 		EspHighlights = {},
-		EspGlows = {},
 		EspLabels = {},
 		Fly = nil,
 		SkinKey = nil,
@@ -2585,16 +2584,12 @@ end
 -- ============================================================
 -- 1. ESP DE JOGADORES
 -- ============================================================
--- opts: { AlwaysOnTop (default true), FillTransparency, BeastColor, SurvivorColor }
 function Core.SetPlayerESP(enabled, opts)
 	Core.ClearPlayerESP()
-	Z.EspOpts = opts or Z.EspOpts or {}
 	if not enabled then return 0 end
-	local o = opts or Z.EspOpts
-	-- default ALWAYS ON TOP: ESP tem que atravessar parede sempre
-	local alwaysOnTop = (o.AlwaysOnTop == nil) and true or (o.AlwaysOnTop and true or false)
-	local fillBeast = o.BeastColor or Color3.fromRGB(255, 45, 45)
-	local fillSurvivor = o.SurvivorColor or Color3.fromRGB(60, 220, 130)
+	opts = opts or {}
+	local fillBeast = opts.BeastColor or Color3.fromRGB(255, 45, 45)
+	local fillSurvivor = opts.SurvivorColor or Color3.fromRGB(60, 220, 130)
 	local created = 0
 
 	for _, p in ipairs(Players:GetPlayers()) do
@@ -2602,10 +2597,9 @@ function Core.SetPlayerESP(enabled, opts)
 			local h = Instance.new("Highlight")
 			h.Name = "ZyonESP"
 			h.Adornee = p.Character
-			h.DepthMode = alwaysOnTop
-				and Enum.HighlightDepthMode.AlwaysOnTop
+			h.DepthMode = opts.AlwaysOnTop and Enum.HighlightDepthMode.AlwaysOnTop
 				or Enum.HighlightDepthMode.Occluded
-			h.FillTransparency = o.FillTransparency or 0.5
+			h.FillTransparency = opts.FillTransparency or 0.5
 			h.OutlineTransparency = 0
 			if isBeast(p) then
 				h.FillColor = fillBeast
@@ -2620,47 +2614,16 @@ function Core.SetPlayerESP(enabled, opts)
 		end
 	end
 
+	track(Players.PlayerAdded:Connect(function(p)
+		p.CharacterAdded:Connect(function(ch)
+			task.wait(0.4)
+			if not Z.EspHighlights[p] and enabled then
+				Core.SetPlayerESP(true, opts)
+			end
+		end)
+	end))
+
 	return created
-end
-
--- liga/desliga atravessar parede em highlights ja existentes (sem recriar)
-function Core.SetESPDepth(alwaysOnTop)
-	local mode = alwaysOnTop and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
-	if Z.EspOpts then Z.EspOpts.AlwaysOnTop = alwaysOnTop end
-	local n = 0
-	for _, h in pairs(Z.EspHighlights) do
-		pcall(function()
-			h.DepthMode = mode
-			n = n + 1
-		end)
-	end
-	return n
-end
-
--- aplica transparencia sem recriar
-function Core.SetESPFillAlpha(alpha01)
-	if Z.EspOpts then Z.EspOpts.FillTransparency = alpha01 end
-	local n = 0
-	for _, h in pairs(Z.EspHighlights) do
-		pcall(function()
-			h.FillTransparency = alpha01
-			n = n + 1
-		end)
-	end
-	return n
-end
-
--- mantem ESP vivo quando alguem entra / respawna
-function Core.StartESPWatcher()
-	if Z.ESPWatcher then return end
-	local function hook(p)
-		p.CharacterAdded:Connect(function()
-			task.wait(0.5)
-			if next(Z.EspHighlights) then Core.SetPlayerESP(true, Z.EspOpts) end
-		end)
-	end
-	for _, p in ipairs(Players:GetPlayers()) do hook(p) end
-	Z.ESPWatcher = track(Players.PlayerAdded:Connect(hook))
 end
 
 function Core.ClearPlayerESP()
@@ -2686,57 +2649,15 @@ local KIND_STYLE = {
 	door     = { text = "DOOR", color = Color3.fromRGB(220, 200, 100) },
 }
 
--- sobe na hierarquia ate achar o modelo do objeto (ComputerTable, FreezePod, ExitDoor, DoubleDoor)
--- ignora comodos/containers pra nao iluminar o predio inteiro nem armas de mapa
-local VALID_GLOW = {
-	computertable = true, computer = true,
-	freezepod = true, pod = true,
-	exitdoor = true, exit = true,
-	doubledoor = true, singledoor = true, door = true,
-	gate = true, shutter = true, lever = true,
-}
-
-local function getGlowModel(part)
-	local p = part.Parent
-	for _ = 1, 4 do
-		if not p or p:IsA("Workspace") then return nil end
-		if p:IsA("Model") then
-			local key = p.Name:lower():gsub("%s+", "")
-			if VALID_GLOW[key] then return p end
-		end
-		p = p.Parent
-	end
-	return nil
-end
-
-function Core.SetInteractiveESP(enabled, showLabels)
+function Core.SetInteractiveESP(enabled)
 	Core.ClearInteractiveESP()
 	if not enabled then return 0 end
 	local created = 0
-	local showText = (showLabels == nil) and true or showLabels
 
 	for _, rec in ipairs(collectTriggers(nil, nil)) do
 		local d = rec.part
-		local style = KIND_STYLE[rec.kind] or KIND_STYLE.door
-		local glowTarget = getGlowModel(d) or d
-
-		-- GLOW: Highlight no objeto inteiro
-		if not glowTarget:FindFirstChild("ZyonGlow") then
-			local h = Instance.new("Highlight")
-			h.Name = "ZyonGlow"
-			h.Adornee = glowTarget
-			h.FillColor = style.color
-			h.FillTransparency = 0.72
-			h.OutlineColor = style.color:Lerp(Color3.new(1, 1, 1), 0.45)
-			h.OutlineTransparency = 0
-			h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-			h.Parent = glowTarget
-			Z.EspGlows[d] = h
-			created = created + 1
-		end
-
-		-- LABEL opcional
-		if showText and not d:FindFirstChild("ZyonLabel") then
+		if not d:FindFirstChild("ZyonLabel") then
+			local style = KIND_STYLE[rec.kind] or KIND_STYLE.door
 			local sign = d:FindFirstChild("ActionSign")
 			local secs = sign and tostring(sign.Value) or ""
 			local label = style.text
@@ -2765,210 +2686,106 @@ function Core.SetInteractiveESP(enabled, showLabels)
 			t.Parent = bb
 
 			Z.EspLabels[d] = bb
+			created = created + 1
 		end
 	end
 	return created
 end
 
 function Core.ClearInteractiveESP()
-	for d, h in pairs(Z.EspGlows or {}) do
-		pcall(function() h:Destroy() end)
-	end
-	Z.EspGlows = {}
 	for d, bb in pairs(Z.EspLabels) do
 		pcall(function() bb:Destroy() end)
 	end
 	Z.EspLabels = {}
-	-- limpa orfaos de reloads anteriores
+	-- limpa orfaos deixados por reloads anteriores
 	for _, rec in ipairs(collectTriggers(nil, nil)) do
-		local g = rec.part:FindFirstChild("ZyonGlow")
-		if g then g:Destroy() end
 		local l = rec.part:FindFirstChild("ZyonLabel")
 		if l then l:Destroy() end
-		local gm = getGlowModel(rec.part)
-		if gm then
-			local g2 = gm:FindFirstChild("ZyonGlow")
-			if g2 then g2:Destroy() end
-		end
 	end
-end
-
--- ajusta transparencia do glow sem recriar
-function Core.SetGlowAlpha(alpha01)
-	local n = 0
-	for _, h in pairs(Z.EspGlows or {}) do
-		pcall(function()
-			h.FillTransparency = alpha01
-			n = n + 1
-		end)
-	end
-	return n
 end
 
 -- ============================================================
--- 3. SKIN CHANGER (troca TextureID / Color no Hammer em uso)
+-- 3. SKIN CHANGER
 -- ============================================================
--- Cada item do ItemDatabase tem atributos:
---   ItemName, Thumbnail, CreatorName, Rarity
--- A marreta e um Model "Hammer" com MeshPart (mesh unico) -> skin = TextureID
--- A gema e um Accessory "Gemstone" com MeshPart -> skin = Color
-local RARITY_NAMES = { [0] = "Default", [1] = "Common", [2] = "Uncommon", [3] = "Rare", [4] = "Legendary" }
-
-local function readItem(m)
-	local a = m:GetAttributes()
-	local model = m:FindFirstChild("Model")
-	local accModel = m:FindFirstChild("AccessoryModel")
-	local meshPart = nil
-	local src = model or accModel
-	if src then
-		for _, c in ipairs(src:GetDescendants()) do
-			if c:IsA("MeshPart") then meshPart = c; break end
-		end
-	end
-	if not meshPart and accModel then
-		for _, c in ipairs(accModel:GetDescendants()) do
-			if c:IsA("MeshPart") then meshPart = c; break end
-		end
-	end
-	local rarity = tonumber(a.Rarity) or 0
-	return {
-		key = m.Name,
-		name = a.ItemName or m.Name,
-		thumb = a.Thumbnail,
-		creator = a.CreatorName,
-		rarity = rarity,
-		rarityName = RARITY_NAMES[rarity] or "?",
-		texture = meshPart and meshPart.TextureID ~= "" and meshPart.TextureID or nil,
-		color = meshPart and meshPart.Color or Color3.fromRGB(163, 162, 165),
-		material = meshPart and meshPart.Material or Enum.Material.Plastic,
-	}
-end
-
--- retorna lista completa e rica (nome, thumb, raridade) + ordem estavel
-function Core.GetSkinCatalogFull()
+function Core.GetSkinCatalog()
 	local folder = ReplicatedStorage:FindFirstChild("ItemDatabase")
 	local hammers, gems = {}, {}
 	if not folder then return hammers, gems end
 	for _, m in ipairs(folder:GetChildren()) do
 		local first = m.Name:sub(1, 1)
-		if first == "H" or first == "G" then
-			local info = readItem(m)
-			if first == "H" then table.insert(hammers, info) else table.insert(gems, info) end
+		if first == "H" then
+			table.insert(hammers, m.Name)
+		elseif first == "G" then
+			table.insert(gems, m.Name)
 		end
 	end
-	local function sorter(a, b)
-		if a.rarity ~= b.rarity then return a.rarity < b.rarity end
-		return a.name:lower() < b.name:lower()
-	end
-	table.sort(hammers, sorter)
-	table.sort(gems, sorter)
+	table.sort(hammers)
+	table.sort(gems)
 	return hammers, gems
 end
 
--- compat: retorna apenas as chaves
-function Core.GetSkinCatalog()
-	local h, g = Core.GetSkinCatalogFull()
-	local hk, gk = {}, {}
-	for _, v in ipairs(h) do table.insert(hk, v.key) end
-	for _, v in ipairs(g) do table.insert(gk, v.key) end
-	return hk, gk
-end
-
--- busca as partes vivas da marreta (dois formatos: Model "Hammer" quando beast,
--- Accessory "PackedHammer" quando survivor)
-local function getHammerPart()
+function Core.ApplySkin(key)
+	if not key or key == "" then return false, "chave vazia" end
 	local ch = getChar()
-	if not ch then return nil end
-	local ham = ch:FindFirstChild("Hammer")
-	if ham then
-		local mp = ham:FindFirstChild("MeshPart") or ham:FindFirstChildWhichIsA("MeshPart")
-		if mp then return mp end
-	end
-	local packed = ch:FindFirstChild("PackedHammer")
-	if packed then
-		for _, c in ipairs(packed:GetDescendants()) do
-			if c:IsA("MeshPart") then return c end
-		end
-		local h = packed:FindFirstChild("Handle")
-		if h and h:IsA("MeshPart") then return h end
-	end
-	return nil
-end
-
-local function getGemPart()
-	local ch = getChar()
-	if not ch then return nil end
-	local gem = ch:FindFirstChild("Gemstone")
-	local holder = gem or ch:FindFirstChild("PackedGemstone")
-	if not holder then return nil end
-	for _, c in ipairs(holder:GetDescendants()) do
-		if c:IsA("MeshPart") then return c end
-	end
-	return nil
-end
-
--- salva o visual original pra poder restaurar
-local function rememberOriginal()
-	local ch = getChar()
-	if not ch or Z.SkinOriginal then return end
-	local hm, gm = getHammerPart(), getGemPart()
-	Z.SkinOriginal = {
-		hammer = hm and { TextureID = hm.TextureID, Color = hm.Color, Material = hm.Material } or nil,
-		gem = gm and { TextureID = gm.TextureID, Color = gm.Color, Material = gm.Material } or nil,
-	}
-end
-
-function Core.ApplySkin(key, part)
-	if not key or key == "" then return false, "nenhuma skin selecionada" end
+	if not ch then return false, "sem personagem" end
+	local hum = ch:FindFirstChildOfClass("Humanoid")
+	if not hum then return false, "sem humanoid" end
 	local folder = ReplicatedStorage:FindFirstChild("ItemDatabase")
 	if not folder then return false, "ItemDatabase ausente" end
 	local item = folder:FindFirstChild(key)
 	if not item then return false, "item inexistente: " .. tostring(key) end
+	local am = item:FindFirstChild("AccessoryModel")
+	if not am then return false, "sem AccessoryModel" end
 
-	rememberOriginal()
-
-	local info = readItem(item)
-	local isGem = key:sub(1, 1) == "G"
-	local target = isGem and getGemPart() or getHammerPart()
-	if not target then
-		return false, isGem and "gema nao equipada" or "marreta nao equipada"
-	end
-	if not target:IsA("MeshPart") then
-		return false, "parte alvo nao e MeshPart"
+	-- limpa skins anteriores (aplicada por nos e a original)
+	for _, c in ipairs(ch:GetChildren()) do
+		if c.Name == "ZyonSkin" or c.Name == "PackedHammer" or c.Name == "PackedGemstone" then
+			c:Destroy()
+		end
 	end
 
-	if info.texture then
-		target.TextureID = info.texture
-		-- textura cobre a cor; deixa neutro pra nao tingir
-		target.Color = Color3.fromRGB(255, 255, 255)
-	else
-		-- sem textura: usa cor solida
-		target.TextureID = ""
-		target.Color = info.color
+	local acc = Instance.new("Accessory")
+	acc.Name = "ZyonSkin"
+
+	for _, src in ipairs(am:GetChildren()) do
+		local part = src:Clone()
+		if part:IsA("BasePart") then
+			part.CanCollide = false
+			part.Massless = true
+			part.Anchored = false
+		end
+		part.Parent = acc
 	end
-	target.Material = info.material
+
+	local handle = acc:FindFirstChild("Handle") or acc:FindFirstChildWhichIsA("BasePart")
+	if not handle then
+		acc:Destroy()
+		return false, "modelo sem parte valida"
+	end
+	handle.Name = "Handle"
+	if not handle:FindFirstChild("AccessoryAttachment") then
+		local att = Instance.new("Attachment")
+		att.Name = "AccessoryAttachment"
+		att.Parent = handle
+	end
+
+	local ok, err = pcall(function() hum:AddAccessory(acc) end)
+	if not ok then
+		acc:Destroy()
+		return false, tostring(err)
+	end
 
 	Z.SkinKey = key
-	Z.SkinName = info.name
-	return true, info.name
+	return true, handle:FindFirstChildWhichIsA("Weld") ~= nil and "weld ok" or "aplicado sem weld"
 end
 
 function Core.RestoreSkin()
 	local ch = getChar()
-	if not ch or not Z.SkinOriginal then return false, "nada pra restaurar" end
-	local hm, gm = getHammerPart(), getGemPart()
-	if hm and Z.SkinOriginal.hammer then
-		hm.TextureID = Z.SkinOriginal.hammer.TextureID
-		hm.Color = Z.SkinOriginal.hammer.Color
-		hm.Material = Z.SkinOriginal.hammer.Material
-	end
-	if gm and Z.SkinOriginal.gem then
-		gm.TextureID = Z.SkinOriginal.gem.TextureID
-		gm.Color = Z.SkinOriginal.gem.Color
-		gm.Material = Z.SkinOriginal.gem.Material
+	if not ch then return false end
+	for _, c in ipairs(ch:GetChildren()) do
+		if c.Name == "ZyonSkin" then c:Destroy() end
 	end
 	Z.SkinKey = nil
-	Z.SkinName = nil
 	return true
 end
 
@@ -3324,202 +3141,46 @@ local hudToggle = tabVisual:AddToggle({
 })
 
 -- ============================================================
--- ABA: SKINS (grid com thumbnail real + nome do jogo)
+-- ABA: SKINS
 -- ============================================================
-local hammerList, gemList = Zyon.GetSkinCatalogFull()
-local skinState = { hammer = nil, gem = nil }
-
--- paleta por raridade
-local RARITY_COLOR = {
-	[0] = Color3.fromRGB(150, 155, 172),
-	[1] = Color3.fromRGB(120, 190, 255),
-	[2] = Color3.fromRGB(110, 230, 160),
-	[3] = Color3.fromRGB(190, 140, 255),
-	[4] = Color3.fromRGB(255, 190, 90),
-}
-
--- componente: grade de skins com imagem
--- (recebe um Frame/Instance ja criado na aba, nao o objeto da aba)
-local function makeSkinGrid(parent, items, cols, onPick)
-	local card = new("Frame", {
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		BackgroundTransparency = 1,
-		Parent = parent,
-	})
-	local grid = new("UIGridLayout", {
-		CellSize = UDim2.fromOffset(84, 96),
-		CellPadding = UDim2.fromOffset(8, 8),
-		SortOrder = Enum.SortOrder.LayoutOrder,
-		Parent = card,
-	})
-	local pad = new("UIPadding", {
-		PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16),
-		PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
-		Parent = card,
-	})
-
-	local cells = {}
-	local function clear()
-		for _, c in ipairs(cells) do c:Destroy() end
-		cells = {}
-	end
-
-	local function render(list)
-		clear()
-		for i, info in ipairs(list) do
-			local cell = new("TextButton", {
-				Name = info.key,
-				BackgroundColor3 = Theme.Card,
-				BorderSizePixel = 0,
-				AutoButtonColor = false,
-				Text = "",
-				LayoutOrder = i,
-				Parent = card,
-			}, { corner(8), stroke(Theme.Stroke, 1) })
-
-			local thumb = new("ImageLabel", {
-				Size = UDim2.new(1, -12, 0, 58),
-				Position = UDim2.fromOffset(6, 6),
-				BackgroundTransparency = 1,
-				Image = info.thumb or "",
-				ScaleType = Enum.ScaleType.Fit,
-				Parent = cell,
-			})
-			-- fallback visual quando nao ha thumbnail
-			if not info.thumb or info.thumb == "" then
-				thumb.Image = ""
-				local ph = new("Frame", {
-					Size = UDim2.new(1, 0, 1, 0),
-					BackgroundColor3 = info.color,
-					BackgroundTransparency = 0.15,
-					Parent = thumb,
-				}, { corner(6) })
-			end
-
-			new("TextLabel", {
-				Size = UDim2.new(1, -8, 0, 26),
-				Position = UDim2.new(0, 4, 1, -30),
-				BackgroundTransparency = 1,
-				Text = info.name,
-				Font = Theme.FontBold,
-				TextSize = 10,
-				TextColor3 = RARITY_COLOR[info.rarity] or Theme.Text,
-				TextWrapped = true,
-				TextTruncate = Enum.TextTruncate.AtEnd,
-				TextXAlignment = Enum.TextXAlignment.Center,
-				Parent = cell,
-			})
-
-			new("UIGradient", {
-				Color = ColorSequence.new(RARITY_COLOR[info.rarity] or Theme.SubText, Theme.Stroke),
-				Rotation = 90,
-				Transparency = NumberSequence.new(0.2, 1),
-				Parent = new("Frame", {
-					Position = UDim2.new(0, 8, 0, 92),
-					Size = UDim2.new(1, -16, 0, 2),
-					BorderSizePixel = 0,
-					BackgroundColor3 = Color3.new(1, 1, 1),
-					Parent = cell,
-				}),
-			})
-
-			local function select()
-				for _, c in ipairs(cells) do
-					pcall(function()
-						c.UIStroke.Transparency = 1
-					end)
-				end
-				local s = cell:FindFirstChildOfClass("UIStroke")
-				if s then s.Transparency = 0 end
-				onPick(info)
-			end
-
-			cell.MouseEnter:Connect(function()
-				tween(cell, { BackgroundColor3 = Theme.CardHover }, 0.12)
-			end)
-			cell.MouseLeave:Connect(function()
-				tween(cell, { BackgroundColor3 = Theme.Card }, 0.18)
-			end)
-			cell.MouseButton1Click:Connect(select)
-			table.insert(cells, cell)
-		end
-	end
-
-	render(items)
-	return { Render = render, Clear = clear }
-end
-
 tabSkin:AddSection("Marreta")
-local skinSearch = tabSkin:AddInput({
-	Name = "Buscar marreta",
-	Placeholder = "ex: rainbow, cash, plushie...",
-	Default = "",
-	Flag = "_skinBusca",
-	NoConfig = true,
-	Live = true,
-})
-local hammerGrid = makeSkinGrid(tabSkin.Content, hammerList, 8, function(info)
-	skinState.hammer = info
-	Window:Notify("Selecionado", info.name .. "  (" .. info.rarityName .. ")", 1.6, "info")
-end)
-local function filterList(list, q)
-	if not q or q == "" then return list end
-	q = q:lower()
-	local out = {}
-	for _, v in ipairs(list) do
-		if v.name:lower():find(q, 1, true) or v.key:lower():find(q, 1, true) then
-			table.insert(out, v)
-		end
-	end
-	return out
-end
-if skinSearch then
-	task.spawn(function()
-		local last = ""
-		while true do
-			task.wait(0.35)
-			local q = skinSearch.Value or ""
-			if q ~= last then
-				last = q
-				hammerGrid.Render(filterList(hammerList, q))
-			end
-		end
-	end)
-end
+local hammerList, gemList = Zyon.GetSkinCatalog()
+local skinState = { key = nil, part = "Hammer" }
 
-tabSkin:AddSection("Gema")
-local gemGrid = makeSkinGrid(tabSkin.Content, gemList, 8, function(info)
-	skinState.gem = info
-	Window:Notify("Selecionado", info.name .. "  (" .. info.rarityName .. ")", 1.6, "info")
-end)
+tabSkin:AddDropdown({
+	Name = "Escolher marreta",
+	Description = string.format("%d marretas disponiveis", #hammerList),
+	Options = hammerList,
+	Default = hammerList[1],
+	Flag = "SkinHammer",
+	Callback = function(name)
+		skinState.key = name
+		skinState.part = "Hammer"
+	end,
+})
+tabSkin:AddDropdown({
+	Name = "Escolher gema",
+	Description = string.format("%d gemas disponiveis", #gemList),
+	Options = gemList,
+	Default = gemList[1],
+	Flag = "SkinGem",
+	Callback = function(name)
+		skinState.key = name
+		skinState.part = "Gem"
+	end,
+})
 
 tabSkin:AddSection("Acoes")
 tabSkin:AddButton({
-	Name = "Aplicar marreta selecionada",
+	Name = "Aplicar skin selecionada",
 	Callback = function()
-		if not skinState.hammer then
-			Window:Notify("Nada selecionado", "Clique numa marreta da grade primeiro", 2, "warn")
+		if not skinState.key then
+			Window:Notify("Nada selecionado", "Escolha uma marreta ou gema primeiro", 2, "warn")
 			return
 		end
-		local ok, msg = Zyon.ApplySkin(skinState.hammer.key)
+		local ok, msg = Zyon.ApplySkin(skinState.key)
 		if ok then
-			Window:Notify("Marreta aplicada", tostring(msg), 2.5, "success")
-		else
-			Window:Notify("Falha ao aplicar", tostring(msg), 3, "error")
-		end
-	end,
-})
-tabSkin:AddButton({
-	Name = "Aplicar gema selecionada",
-	Callback = function()
-		if not skinState.gem then
-			Window:Notify("Nada selecionado", "Clique numa gema da grade primeiro", 2, "warn")
-			return
-		end
-		local ok, msg = Zyon.ApplySkin(skinState.gem.key)
-		if ok then
-			Window:Notify("Gema aplicada", tostring(msg), 2.5, "success")
+			Window:Notify("Skin aplicada", skinState.key .. " (" .. tostring(msg) .. ")", 2.5, "success")
 		else
 			Window:Notify("Falha ao aplicar", tostring(msg), 3, "error")
 		end
@@ -3528,10 +3189,10 @@ tabSkin:AddButton({
 tabSkin:AddButton({
 	Name = "Randomizar marreta",
 	Callback = function()
-		local info = hammerList[math.random(1, #hammerList)]
-		local ok, msg = Zyon.ApplySkin(info.key)
-		skinState.hammer = info
-		Window:Notify(ok and "Marreta aleatoria" or "Falhou", tostring(msg), 2, ok and "success" or "error")
+		local key = hammerList[math.random(1, #hammerList)]
+		local ok, msg = Zyon.ApplySkin(key)
+		skinState.key = key
+		Window:Notify(ok and "Skin aleatoria" or "Falhou", key, 2, ok and "success" or "error")
 	end,
 })
 tabSkin:AddButton({
@@ -3564,21 +3225,14 @@ tabSkin:AddButton({
 			Window:Notify("Alvo invalido", "Jogador sem personagem", 2, "warn")
 			return
 		end
-		local ham = p.Character:FindFirstChild("Hammer")
-		local mp = ham and ham:FindFirstChild("MeshPart")
-		if not mp then
-			Window:Notify("Nao encontrado", "Alvo sem marreta visivel", 2, "warn")
-			return
+		for _, c in ipairs(p.Character:GetChildren()) do
+			if c:IsA("Accessory") and (c.Name:find("Hammer") or c.Name:find("Gem")) then
+				Zyon.ApplySkin(c.Name)
+				Window:Notify("Copia", "Aplicando " .. c.Name .. " (se existir no banco)", 2, "info")
+				return
+			end
 		end
-		local myHam = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Hammer")
-		local myMp = myHam and myHam:FindFirstChild("MeshPart")
-		if not myMp then
-			Window:Notify("Sem marreta", "Voce nao esta com marreta equipada", 2, "warn")
-			return
-		end
-		myMp.TextureID = mp.TextureID
-		myMp.Color = mp.Color
-		Window:Notify("Copiado", "Visual de " .. p.Name .. " aplicado", 2.5, "success")
+		Window:Notify("Nao encontrado", "Alvo sem marreta visivel", 2, "warn")
 	end,
 })
 
