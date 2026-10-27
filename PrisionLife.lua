@@ -1,0 +1,4603 @@
+--[[
+    Zyon Menu - Vida na Prisao
+    Script unico: nucleo (ESP, movimento, utilidade, aimbot) + interface.
+    Carregue com loadstring. RightShift abre e fecha o menu.
+]]
+
+local __ZYON_STATE = { config = {}, move = {}, util = {}, aim = {} }
+local __ZYON_CLEANUPS = {}
+
+local function __zyon_on_cleanup(fn)
+    table.insert(__ZYON_CLEANUPS, fn)
+end
+
+
+-- ==========================================================================
+-- MODULO: prison_esp
+-- ==========================================================================
+-- language: Luau, file: prison_esp.luau, target: Real executor / Vida na Prisao (Prison Life BR)
+-- *modulo ESP: jogadores, itens, givers escondidos, chams. Drawing e viewport-aligned (sem inset)*
+-- *WorldToViewportPoint, nunca WorldToScreenPoint - o Real nao aplica o inset de 36px do topbar*
+
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local Camera = Workspace.CurrentCamera
+
+local LocalPlayer = Players.LocalPlayer
+
+-- estado compartilhado com o reload
+local STATE = __ZYON_STATE
+STATE.drawings = STATE.drawings or {}
+STATE.config = STATE.config or {
+    player_box       = true,
+    player_name      = true,
+    player_health    = true,
+    player_distance  = true,
+    player_team      = true,
+    player_chams     = false,
+    item_esp         = true,
+    giver_esp        = true,
+    tracer           = false,
+    max_distance     = 2000,
+    team_colors      = {
+        Guards    = Color3.fromRGB(90, 160, 255),
+        Inmates   = Color3.fromRGB(255, 140, 60),
+        Criminals = Color3.fromRGB(255, 70, 70),
+        Neutral   = Color3.fromRGB(180, 180, 180),
+    },
+    default_color    = Color3.fromRGB(200, 200, 200),
+}
+
+local cfg = STATE.config
+
+--------------------------------------------------------------------------
+-- pool de Drawing: reusa handles, nunca vaza objeto no reload
+--------------------------------------------------------------------------
+local pool = STATE.drawings
+
+local function acquire(kind)
+    local obj = table.remove(pool, #pool)
+    if obj and obj.__kind == kind then
+        return obj
+    end
+    if obj then obj:Remove() end
+    local d = Drawing.new(kind)
+    d.__kind = kind
+    d.Visible = false
+    return d
+end
+
+local active = {}   -- objetos em uso neste frame
+
+local function release_all()
+    for _, d in ipairs(active) do
+        d.Visible = false
+        table.insert(pool, d)
+    end
+    table.clear(active)
+end
+
+local function take(kind)
+    local d = acquire(kind)
+    d.Visible = true
+    table.insert(active, d)
+    return d
+end
+
+--------------------------------------------------------------------------
+-- util
+--------------------------------------------------------------------------
+local function team_color(player)
+    local team = player.Team and player.Team.Name
+    return (team and cfg.team_colors[team]) or cfg.default_color
+end
+
+local function root_of(character)
+    return character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+end
+
+local function health_color(fraction)
+    -- verde em 100%, amarelo no meio, vermelho baixo
+    if fraction > 0.5 then
+        return Color3.fromRGB(255, 255, 255):Lerp(Color3.fromRGB(80, 255, 80), (fraction - 0.5) * 2)
+    end
+    return Color3.fromRGB(255, 70, 70):Lerp(Color3.fromRGB(255, 255, 255), fraction * 2)
+end
+
+--------------------------------------------------------------------------
+-- ESP de jogadores
+--------------------------------------------------------------------------
+local function draw_player(player)
+    local character = player.Character
+    if not character then return end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = root_of(character)
+    if not humanoid or not root or humanoid.Health <= 0 then return end
+
+    local origin = Camera.CFrame.Position
+    local distance = (root.Position - origin).Magnitude
+    if distance > cfg.max_distance then return end
+
+    -- parte superior e inferior do box
+    local head = character:FindFirstChild("Head")
+    local torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
+    if not torso then return end
+
+    local top = head and head.Position + Vector3.new(0, head.Size.Y * 0.5, 0)
+        or (torso.Position + Vector3.new(0, 1.5, 0))
+    local bottom = root.Position - Vector3.new(0, 2.6, 0)
+
+    local top_screen, top_visible = Camera:WorldToViewportPoint(top)
+    local bottom_screen, bottom_visible = Camera:WorldToViewportPoint(bottom)
+    if not (top_visible and bottom_visible) then return end
+    if top_screen.Z <= 0 then return end
+
+    local height = math.abs(top_screen.Y - bottom_screen.Y)
+    if height < 4 then return end
+    local width = height * 0.55
+    local x = top_screen.X - width * 0.5
+    local y = top_screen.Y
+
+    local color = team_color(player)
+
+    if cfg.player_box then
+        local box = take("Square")
+        box.Size = Vector2.new(width, height)
+        box.Position = Vector2.new(x, y)
+        box.Color = color
+        box.Thickness = 1
+        box.Filled = false
+        box.Transparency = 0.3
+    end
+
+    local label_y = y - 16
+
+    if cfg.player_name then
+        local text = take("Text")
+        text.Text = string.format("%s [%s]", player.Name, player.Team and player.Team.Name or "?")
+        text.Position = Vector2.new(x + width * 0.5, label_y)
+        text.Center = true
+        text.Size = 13
+        text.Color = color
+        text.Outline = true
+        text.OutlineColor = Color3.new(0, 0, 0)
+    end
+
+    if cfg.player_health then
+        local fraction = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+        -- barra vertical a esquerda do box
+        local bar_bg = take("Square")
+        bar_bg.Size = Vector2.new(3, height)
+        bar_bg.Position = Vector2.new(x - 6, y)
+        bar_bg.Color = Color3.fromRGB(30, 30, 30)
+        bar_bg.Filled = true
+        bar_bg.Transparency = 0.4
+
+        local bar = take("Square")
+        bar.Size = Vector2.new(3, height * fraction)
+        bar.Position = Vector2.new(x - 6, y + height * (1 - fraction))
+        bar.Color = health_color(fraction)
+        bar.Filled = true
+        bar.Transparency = 0.1
+
+        local hp_text = take("Text")
+        hp_text.Text = tostring(math.floor(humanoid.Health))
+        hp_text.Position = Vector2.new(x - 14, y + height * 0.5)
+        hp_text.Center = true
+        hp_text.Size = 11
+        hp_text.Color = health_color(fraction)
+        hp_text.Outline = true
+        hp_text.OutlineColor = Color3.new(0, 0, 0)
+    end
+
+    if cfg.player_distance then
+        local text = take("Text")
+        text.Text = string.format("%d studs", math.floor(distance))
+        text.Position = Vector2.new(x + width * 0.5, y + height + 16)
+        text.Center = true
+        text.Size = 11
+        text.Color = color
+        text.Outline = true
+        text.OutlineColor = Color3.new(0, 0, 0)
+    end
+
+    if cfg.tracer then
+        local line = take("Line")
+        line.From = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y)
+        line.To = Vector2.new(top_screen.X, y + height * 0.5)
+        line.Color = color
+        line.Thickness = 1
+        line.Transparency = 0.4
+    end
+end
+
+--------------------------------------------------------------------------
+-- ESP de itens e givers (inclui os escondidos por GiverHider)
+--------------------------------------------------------------------------
+local function is_esp_item(instance)
+    if instance:IsA("Tool") then return true end
+    local parent = instance.Parent
+    if not parent then return false end
+    if parent:IsA("Player") or parent:IsA("Model") then return false end
+    -- givers e drops ficam em Models com tag
+    return false
+end
+
+local function draw_givers()
+    if not cfg.giver_esp then return end
+
+    local origin = Camera.CFrame.Position
+    local seen = {}
+
+    -- Giver, TouchGiver e Drop: os invisiveis contam igual
+    for _, tag in ipairs({ "Giver", "TouchGiver", "Drop" }) do
+        for _, giver in ipairs(CollectionService:GetTagged(tag)) do
+            if giver:IsDescendantOf(Workspace) and not seen[giver] then
+                seen[giver] = true
+
+                local pivot = giver:GetPivot().Position
+                local distance = (pivot - origin).Magnitude
+                if distance <= cfg.max_distance then
+                    local screen, visible = Camera:WorldToViewportPoint(pivot)
+                    if visible and screen.Z > 0 then
+                        local tool = giver:GetAttribute("ToolName") or giver.Name
+
+                        -- GiverHider deixa a parte com Transparency=1 e guarda o original.
+                        -- Se o original existia, o giver esta escondido do meu time.
+                        local hidden = false
+                        for _, part in ipairs(giver:GetDescendants()) do
+                            if part:IsA("BasePart") and part:GetAttribute("OriginalTransparency") then
+                                if part.Transparency >= 1 then hidden = true end
+                                break
+                            end
+                        end
+
+                        local tags = CollectionService:GetTags(giver)
+                        local team_tag = "Any"
+                        for _, t in ipairs(tags) do
+                            if string.sub(t, 1, 5) == "Team_" then team_tag = string.sub(t, 6) end
+                        end
+
+                        local text = take("Text")
+                        text.Text = string.format("%s%s [%s] %dm",
+                            tool, hidden and " (oculto)" or "", team_tag, math.floor(distance))
+                        text.Position = Vector2.new(screen.X, screen.Y)
+                        text.Center = true
+                        text.Size = 12
+                        text.Color = hidden and Color3.fromRGB(255, 210, 60) or Color3.fromRGB(120, 255, 160)
+                        text.Outline = true
+                        text.OutlineColor = Color3.new(0, 0, 0)
+                    end
+                end
+            end
+        end
+    end
+end
+
+--------------------------------------------------------------------------
+-- chams
+--------------------------------------------------------------------------
+local highlights = {}
+
+local function update_chams()
+    if not cfg.player_chams then
+        for player, hl in pairs(highlights) do
+            hl:Destroy()
+            highlights[player] = nil
+        end
+        return
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local hl = highlights[player]
+            if not hl or not hl.Parent then
+                hl = Instance.new("Highlight")
+                hl.FillTransparency = 0.55
+                hl.OutlineTransparency = 0.1
+                hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                hl.Parent = player.Character
+                highlights[player] = hl
+            end
+            hl.FillColor = team_color(player)
+            hl.OutlineColor = team_color(player)
+        end
+    end
+end
+
+--------------------------------------------------------------------------
+-- loop
+--------------------------------------------------------------------------
+local connection
+
+local function render()
+    release_all()
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local ok, err = pcall(draw_player, player)
+            if not ok then
+                -- nao deixa um character sumindo no meio do frame matar o loop
+            end
+        end
+    end
+
+    pcall(draw_givers)
+    pcall(update_chams)
+end
+
+connection = RunService.RenderStepped:Connect(render)
+
+__zyon_on_cleanup(function()
+    if connection then connection:Disconnect() end
+    for _, d in ipairs(active) do pcall(function() d:Remove() end) end
+    for _, d in ipairs(pool) do pcall(function() d:Remove() end) end
+    table.clear(active)
+    table.clear(pool)
+    for _, hl in pairs(highlights) do pcall(function() hl:Destroy() end) end
+    table.clear(highlights)
+end)
+
+
+
+
+-- ==========================================================================
+-- MODULO: prison_move
+-- ==========================================================================
+-- language: Luau, file: prison_move.luau, target: Real executor / Vida na Prisao
+-- *movimento: speed, fly, jump, gravity, teleport. BodyVelocity + CFrame obrigatorio pro fly*
+-- *WalkSpeed nao e corrigido pelo servidor - testado, persistiu >1s em 120*
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local STATE = __ZYON_STATE
+
+STATE.move = STATE.move or {
+    speed_enabled = false,
+    speed_value   = 60,
+    fly_enabled   = false,
+    fly_speed     = 55,
+    jump_enabled  = false,
+    jump_value    = 120,
+    gravity_enabled = false,
+    gravity_value   = 120,
+}
+
+local cfg = STATE.move
+
+--------------------------------------------------------------------------
+-- estado interno
+--------------------------------------------------------------------------
+local fly_body_velocity = nil
+local fly_body_gyro = nil
+local connections = {}
+
+local function character_ready()
+    local character = LocalPlayer.Character
+    if not character then return nil end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not root then return nil end
+    return character, humanoid, root
+end
+
+local DEFAULT_SPEED = 16
+local DEFAULT_JUMP = 50
+local DEFAULT_GRAVITY = 196.2
+
+--------------------------------------------------------------------------
+-- speed
+--------------------------------------------------------------------------
+local function apply_speed()
+    local character, humanoid = character_ready()
+    if not humanoid then return end
+    if cfg.speed_enabled then
+        humanoid.WalkSpeed = cfg.speed_value
+    else
+        humanoid.WalkSpeed = DEFAULT_SPEED
+    end
+end
+
+--------------------------------------------------------------------------
+-- jump
+--------------------------------------------------------------------------
+local function apply_jump()
+    local character, humanoid = character_ready()
+    if not humanoid then return end
+    if cfg.jump_enabled then
+        humanoid.UseJumpPower = true
+        humanoid.JumpPower = cfg.jump_value
+    else
+        humanoid.UseJumpPower = true
+        humanoid.JumpPower = DEFAULT_JUMP
+    end
+end
+
+--------------------------------------------------------------------------
+-- gravity
+--------------------------------------------------------------------------
+local function apply_gravity()
+    Workspace.Gravity = cfg.gravity_enabled and cfg.gravity_value or DEFAULT_GRAVITY
+end
+
+--------------------------------------------------------------------------
+-- fly
+-- BodyVelocity sozinho da 0 - o Humanoid briga com a fisica.
+-- A combinacao que funciona: BodyVelocity + CFrame incremental por frame.
+--------------------------------------------------------------------------
+local function stop_fly()
+    if fly_body_velocity then
+        fly_body_velocity:Destroy()
+        fly_body_velocity = nil
+    end
+    if fly_body_gyro then
+        fly_body_gyro:Destroy()
+        fly_body_gyro = nil
+    end
+    local character, humanoid = character_ready()
+    if humanoid then
+        humanoid.PlatformStand = false
+        humanoid.WalkSpeed = cfg.speed_enabled and cfg.speed_value or DEFAULT_SPEED
+    end
+end
+
+local function start_fly()
+    local character, humanoid, root = character_ready()
+    if not root then return end
+
+    fly_body_velocity = Instance.new("BodyVelocity")
+    fly_body_velocity.Name = "prison_fly_vel"
+    fly_body_velocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    fly_body_velocity.Velocity = Vector3.zero
+    fly_body_velocity.Parent = root
+
+    fly_body_gyro = Instance.new("BodyGyro")
+    fly_body_gyro.Name = "prison_fly_gyro"
+    fly_body_gyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+    fly_body_gyro.P = 9000
+    fly_body_gyro.Parent = root
+end
+
+local fly_loop
+
+local function fly_step()
+    if not cfg.fly_enabled then return end
+    local character, humanoid, root = character_ready()
+    if not root then return end
+    if not fly_body_velocity or not fly_body_velocity.Parent then
+        start_fly()
+        return
+    end
+
+    -- direcao a partir da camera
+    local look = Camera.CFrame.LookVector
+    local right = Camera.CFrame.RightVector
+    local move = Vector3.zero
+
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += look end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= look end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += right end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= right end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then move += Vector3.new(0, 1, 0) end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then move -= Vector3.new(0, 1, 0) end
+
+    if move.Magnitude > 0 then
+        move = move.Unit * cfg.fly_speed * 3
+    end
+
+    fly_body_velocity.Velocity = move
+    fly_body_gyro.CFrame = Camera.CFrame
+    humanoid.PlatformStand = true
+end
+
+--------------------------------------------------------------------------
+-- teleport
+--------------------------------------------------------------------------
+function STATE.teleport_to(position)
+    local character, humanoid, root = character_ready()
+    if not character then return false end
+    character:PivotTo(CFrame.new(position + Vector3.new(0, 3, 0)))
+    return true
+end
+
+function STATE.teleport_to_player(player)
+    local character = player.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if not root then return false end
+    local offset = root.CFrame.LookVector * 6
+    return STATE.teleport_to(root.Position + offset)
+end
+
+--------------------------------------------------------------------------
+-- anti-jump-guard: o AntiJump do jogo cancela pulos fora do estado esperado.
+-- Mata o LocalScript no proprio character. Client-side, sem tocar no servidor.
+--------------------------------------------------------------------------
+function STATE.kill_antijump()
+    local character = LocalPlayer.Character
+    if not character then return false end
+    local guard = character:FindFirstChild("AntiJump")
+    if not guard then return false end
+    pcall(function() guard.Disabled = true end)
+    pcall(function() guard:Destroy() end)
+    return true
+end
+
+--------------------------------------------------------------------------
+-- aplica em troca de personagem e mantem estado
+--------------------------------------------------------------------------
+local function on_character(character)
+    if cfg.fly_enabled then
+        stop_fly()
+    end
+    task.wait(0.5)
+    apply_speed()
+    apply_jump()
+    if cfg.fly_enabled then
+        start_fly()
+    end
+end
+
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(on_character))
+
+-- heartbeat do fly
+table.insert(connections, RunService.Heartbeat:Connect(function()
+    if cfg.fly_enabled then
+        local ok, err = pcall(fly_step)
+        if not ok and fly_body_velocity then
+            pcall(stop_fly)
+        end
+    else
+        if fly_body_velocity then
+            stop_fly()
+        end
+    end
+end))
+
+-- reaplica speed/jump se algo zerar por fora
+table.insert(connections, RunService.Heartbeat:Connect(function()
+    if cfg.speed_enabled then
+        local character, humanoid = character_ready()
+        if humanoid and math.abs(humanoid.WalkSpeed - cfg.speed_value) > 0.5 then
+            humanoid.WalkSpeed = cfg.speed_value
+        end
+    end
+end))
+
+STATE.move_apply = {
+    speed = apply_speed,
+    jump = apply_jump,
+    gravity = apply_gravity,
+    fly = function()
+        if cfg.fly_enabled then start_fly() else stop_fly() end
+    end,
+}
+
+__zyon_on_cleanup(function()
+    for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+    table.clear(connections)
+    stop_fly()
+    Workspace.Gravity = DEFAULT_GRAVITY
+    local character, humanoid = character_ready()
+    if humanoid then
+        humanoid.WalkSpeed = DEFAULT_SPEED
+        humanoid.JumpPower = DEFAULT_JUMP
+        humanoid.PlatformStand = false
+    end
+end)
+
+
+
+
+-- ==========================================================================
+-- MODULO: prison_util
+-- ==========================================================================
+-- language: Luau, file: prison_util.luau, target: Real executor / Vida na Prisao
+-- *utilidade: portas remotas, givers, espionagem de inventario, fullbright, FOV*
+-- *todo o movimento daqui e client-side - o servidor nao valida, testado*
+
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local STATE = __ZYON_STATE
+
+STATE.util = STATE.util or {
+    fullbright   = false,
+    fov_enabled  = false,
+    fov_value    = 90,
+    no_fog       = false,
+}
+
+local cfg = STATE.util
+
+local original = {
+    brightness      = nil,
+    ambient         = nil,
+    outdoor_ambient = nil,
+    fog_end         = nil,
+    fov             = nil,
+    clock_time      = nil,
+}
+
+--------------------------------------------------------------------------
+-- portas: LocalDoors remove a parte "block" quando LocalPlayerOpened = true
+-- funciona a 51 studs de distancia (testado). O servidor acha que esta fechada.
+--------------------------------------------------------------------------
+function STATE.open_all_doors(duration)
+    local count = 0
+    for _, door in ipairs(CollectionService:GetTagged("Door")) do
+        door:SetAttribute("LocalPlayerOpened", true)
+        count += 1
+        if duration then
+            task.delay(duration, function()
+                if door and door.Parent then
+                    door:SetAttribute("LocalPlayerOpened", false)
+                end
+            end)
+        end
+    end
+    return count
+end
+
+function STATE.close_all_doors()
+    local count = 0
+    for _, door in ipairs(CollectionService:GetTagged("Door")) do
+        door:SetAttribute("LocalPlayerOpened", false)
+        count += 1
+    end
+    return count
+end
+
+function STATE.nearest_doors(radius)
+    radius = radius or 100
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return {} end
+
+    local result = {}
+    for _, door in ipairs(CollectionService:GetTagged("Door")) do
+        local distance = (door:GetPivot().Position - root.Position).Magnitude
+        if distance <= radius then
+            table.insert(result, { door = door, distance = distance })
+        end
+    end
+    table.sort(result, function(a, b) return a.distance < b.distance end)
+    return result
+end
+
+--------------------------------------------------------------------------
+-- givers: o servidor exige toque fisico, mas da pra listar tudo
+-- e caminhar ate o mais proximo devolve o que existe no mapa.
+-- GiverHider esconde os de time alheio - lemos OriginalTransparency.
+--------------------------------------------------------------------------
+function STATE.list_givers()
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local my_position = root and root.Position or Vector3.zero
+
+    local result = {}
+    for _, tag in ipairs({ "Giver", "TouchGiver", "Drop" }) do
+        for _, giver in ipairs(CollectionService:GetTagged(tag)) do
+            local tags = CollectionService:GetTags(giver)
+            local team_tag = "Any"
+            for _, t in ipairs(tags) do
+                if string.sub(t, 1, 5) == "Team_" then
+                    team_tag = string.sub(t, 6)
+                end
+            end
+
+            local hidden = false
+            for _, part in ipairs(giver:GetDescendants()) do
+                if part:IsA("BasePart") and part:GetAttribute("OriginalTransparency") then
+                    hidden = part.Transparency >= 1
+                    break
+                end
+            end
+
+            table.insert(result, {
+                instance = giver,
+                tag      = tag,
+                tool     = giver:GetAttribute("ToolName") or giver.Name,
+                team     = team_tag,
+                hidden   = hidden,
+                distance = (giver:GetPivot().Position - my_position).Magnitude,
+            })
+        end
+    end
+
+    table.sort(result, function(a, b) return a.distance < b.distance end)
+    return result
+end
+
+-- teleporta para o giver e deixa o toque acontecer no proximo frame.
+-- o toque fisico e o unico caminho que o servidor aceita.
+function STATE.go_to_giver(tool_name)
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+
+    for _, giver in ipairs(STATE.list_givers()) do
+        if not tool_name or string.find(string.lower(giver.tool), string.lower(tool_name), 1, true) then
+            local pivot = giver.instance:GetPivot().Position
+            character:PivotTo(CFrame.new(pivot + Vector3.new(0, 3, 0)))
+            return true, giver.tool
+        end
+    end
+    return false
+end
+
+--------------------------------------------------------------------------
+-- inventario de qualquer jogador
+--------------------------------------------------------------------------
+function STATE.read_inventory(player)
+    local result = { character = {}, backpack = {} }
+    if not player then return result end
+
+    local character = player.Character
+    if character then
+        for _, item in ipairs(character:GetChildren()) do
+            if item:IsA("Tool") then
+                table.insert(result.character, item.Name)
+            end
+        end
+    end
+
+    local backpack = player:FindFirstChild("Backpack")
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") then
+                table.insert(result.backpack, item.Name)
+            end
+        end
+    end
+
+    return result
+end
+
+function STATE.all_inventories()
+    local result = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            result[player.Name] = STATE.read_inventory(player)
+        end
+    end
+    return result
+end
+
+--------------------------------------------------------------------------
+-- lighting
+--------------------------------------------------------------------------
+local function cache_original()
+    if original.brightness == nil then
+        original.brightness = Lighting.Brightness
+        original.ambient = Lighting.Ambient
+        original.outdoor_ambient = Lighting.OutdoorAmbient
+        original.clock_time = Lighting.ClockTime
+        local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+        if atmosphere then
+            original.fog_end = atmosphere.Density
+        end
+        original.fov = Camera.FieldOfView
+    end
+end
+
+function STATE.apply_lighting()
+    cache_original()
+
+    if cfg.fullbright then
+        Lighting.Brightness = 3
+        Lighting.Ambient = Color3.fromRGB(180, 180, 180)
+        Lighting.OutdoorAmbient = Color3.fromRGB(180, 180, 180)
+        Lighting.ClockTime = 12
+    else
+        Lighting.Brightness = original.brightness
+        Lighting.Ambient = original.ambient
+        Lighting.OutdoorAmbient = original.outdoor_ambient
+        Lighting.ClockTime = original.clock_time
+    end
+
+    local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+    if atmosphere and original.fog_end then
+        atmosphere.Density = cfg.no_fog and 0 or original.fog_end
+    end
+
+    Camera.FieldOfView = cfg.fov_enabled and cfg.fov_value or original.fov
+end
+
+__zyon_on_cleanup(function()
+    if original.brightness then
+        Lighting.Brightness = original.brightness
+        Lighting.Ambient = original.ambient
+        Lighting.OutdoorAmbient = original.outdoor_ambient
+        Lighting.ClockTime = original.clock_time
+        local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+        if atmosphere and original.fog_end then
+            atmosphere.Density = original.fog_end
+        end
+        Camera.FieldOfView = original.fov
+    end
+end)
+
+
+
+
+-- ==========================================================================
+-- MODULO: prison_aim
+-- ==========================================================================
+-- language: Luau, file: prison_aim.luau, target: Real executor / Vida na Prisao
+-- *aimbot v2: CameraType.Scriptable - assume o controle da camera do PlayerModule*
+-- *v1 falhava porque CameraType.Custom deixa o PlayerModule sobrescrever a CFrame todo frame*
+-- *enquanto o aim esta ativo a camera e nossa; ao desligar, devolve o controle*
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local STATE = __ZYON_STATE
+
+STATE.aim = STATE.aim or {
+    enabled       = false,
+    key           = Enum.KeyCode.E,
+    fov           = 400,
+    smoothness    = 0.0,
+    part          = "Head",
+    team_check    = true,
+    visible_only  = true,
+    show_fov      = true,
+    manage_camera = true,
+    armed_only    = true,    -- so trava em quem esta armado
+    armed_backpack = true,   -- arma na mochila tambem conta
+    armed_enemies_only = true, -- so time inimigo (Guard <-> Inmate/Criminal)
+    armed_names   = nil,     -- preenchido abaixo a partir do ToolProperties
+    vision_360    = true,    -- pega alvo fora da tela (atras, ao lado)
+    vision_360_angle = 180,  -- cone lateral em graus quando 360 esta ligado
+    max_range     = 1000,    -- alcance maximo do aimbot em studs
+    wall_aim      = false,   -- trava mesmo sem linha de visao
+    toggleKey     = Enum.KeyCode.G, -- atalho que liga/desliga
+}
+
+local cfg = STATE.aim
+
+--------------------------------------------------------------------------
+-- classificacao de arma
+--------------------------------------------------------------------------
+-- nomes das armas de fogo, vindos do ToolProperties do proprio jogo
+local FIREARMS = {
+    ["MP5"] = true, ["M9"] = true, ["AK-47"] = true, ["M4A1"] = true,
+    ["M700"] = true, ["FAL"] = true, ["Remington 870"] = true, ["Revolver"] = true,
+}
+
+-- melee e equipamento que NAO conta como "armado"
+local NOT_A_WEAPON = {
+    ["Handcuffs"] = true, ["Riot Shield"] = true, ["Taser"] = true,
+}
+
+local function is_weapon_tool(tool)
+    if not tool:IsA("Tool") then return false end
+    if NOT_A_WEAPON[tool.Name] then return false end
+    if FIREARMS[tool.Name] then return true end
+    -- faca, martelo e outras melee: o nome esta em ToolName ou e MeleeTool
+    local melee_script = tool:FindFirstChildOfClass("LocalScript") or tool:FindFirstChild("MeleeToolScript")
+    if melee_script then return true end
+    local weapon_name = tool:GetAttribute("ToolName")
+    if weapon_name and not NOT_A_WEAPON[weapon_name] then return true end
+    return false
+end
+
+function STATE.has_weapon(player)
+    local character = player.Character
+    if not character then return false end
+
+    -- empunhado
+    for _, child in ipairs(character:GetChildren()) do
+        if child:IsA("Tool") and is_weapon_tool(child) then
+            return true, child.Name
+        end
+    end
+
+    -- mochila: le do proprio STATE para nao depender de cfg estar ligado ainda
+    local aim_cfg = STATE.aim
+    local conta_mochila = true
+    if aim_cfg and aim_cfg.armed_backpack == false then
+        conta_mochila = false
+    end
+
+    if conta_mochila then
+        local backpack = player:FindFirstChild("Backpack")
+        if backpack then
+            for _, child in ipairs(backpack:GetChildren()) do
+                if child:IsA("Tool") and is_weapon_tool(child) then
+                    return true, child.Name .. " (mochila)"
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+-- Guard e Inmate sao inimigos; Criminal tambem e inimigo do Guard
+local function are_enemies(a, b)
+    local team_a = a.Team and a.Team.Name
+    local team_b = b.Team and b.Team.Name
+    if not team_a or not team_b then return false end
+    if team_a == team_b then return false end
+    if team_a == "Neutral" or team_b == "Neutral" then return false end
+    return true
+end
+
+--------------------------------------------------------------------------
+-- FOV circle
+--------------------------------------------------------------------------
+local fov_circle = Drawing.new("Circle")
+fov_circle.Thickness = 1
+fov_circle.NumSides = 60
+fov_circle.Filled = false
+fov_circle.Color = Color3.fromRGB(96, 205, 255)
+fov_circle.Transparency = 0.45
+fov_circle.Visible = false
+
+--------------------------------------------------------------------------
+-- controle de camera
+--------------------------------------------------------------------------
+local saved_camera_type = nil
+local manual_yaw, manual_pitch = 0, 0
+local we_own_camera = false
+
+local function take_camera()
+    if not cfg.manage_camera then return end
+
+    if not we_own_camera then
+        saved_camera_type = Camera.CameraType
+        we_own_camera = true
+        local look = Camera.CFrame.LookVector
+        manual_yaw = math.atan2(-look.X, -look.Z)
+        manual_pitch = math.asin(math.clamp(look.Y, -1, 1))
+    end
+
+    if Camera.CameraType ~= Enum.CameraType.Scriptable then
+        Camera.CameraType = Enum.CameraType.Scriptable
+    end
+end
+
+local function release_camera()
+    if not we_own_camera then return end
+    we_own_camera = false
+    if saved_camera_type and saved_camera_type ~= Enum.CameraType.Scriptable then
+        Camera.CameraType = saved_camera_type
+    else
+        Camera.CameraType = Enum.CameraType.Custom
+    end
+    saved_camera_type = nil
+end
+
+--------------------------------------------------------------------------
+-- alvo
+--------------------------------------------------------------------------
+local function is_valid_target(player)
+    if player == LocalPlayer then return false end
+    local character = player.Character
+    if not character then return false end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return false end
+    if not character:FindFirstChild("HumanoidRootPart") then return false end
+
+    if cfg.team_check then
+        local my_team = LocalPlayer.Team
+        if my_team and player.Team == my_team then return false end
+    end
+
+    if cfg.armed_enemies_only then
+        if not are_enemies(LocalPlayer, player) then return false end
+    end
+
+    if cfg.armed_only then
+        if not STATE.has_weapon(player) then return false end
+    end
+
+    return true
+end
+
+local function get_aim_part(character)
+    if cfg.part == "Torso" then
+        return character:FindFirstChild("UpperTorso")
+            or character:FindFirstChild("Torso")
+            or character:FindFirstChild("HumanoidRootPart")
+    end
+    return character:FindFirstChild("Head")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("HumanoidRootPart")
+end
+
+local ray_params = RaycastParams.new()
+ray_params.FilterType = Enum.RaycastFilterType.Exclude
+
+local function is_visible(part, character)
+    if not cfg.visible_only then return true end
+    local filter = {}
+    if LocalPlayer.Character then table.insert(filter, LocalPlayer.Character) end
+    table.insert(filter, character)
+    ray_params.FilterDescendantsInstances = filter
+
+    local origin = Camera.CFrame.Position
+    local result = Workspace:Raycast(origin, part.Position - origin, ray_params)
+    return result == nil
+end
+
+-- linha de visao checada do personagem (nao da camera):
+-- evita pegar quem esta atras de parede ou fora do angulo real de visao
+local function tem_linha_de_visao(part, character)
+    local meu = LocalPlayer.Character
+    local meu_root = meu and meu:FindFirstChild("HumanoidRootPart")
+    if not meu_root then return false end
+    if not character then return false end
+
+    local filter = { meu, character }
+    ray_params.FilterDescendantsInstances = filter
+    local origem = meu_root.Position + Vector3.new(0, 1.5, 0)
+    local alvo = part.Position
+    local dist = (alvo - origem).Magnitude
+    if dist > cfg.max_range then return false end
+
+    local result = Workspace:Raycast(origem, alvo - origem, ray_params)
+    return result == nil
+end
+
+--------------------------------------------------------------------------
+-- memoria de alvo: segura o cara por um tempo mesmo se ele largar a arma
+-- evita o alvo "escapar" no meio da mira
+--------------------------------------------------------------------------
+local locked_player = nil
+local locked_until = 0
+local LOCK_HOLD = 0.5
+
+local function find_target()
+    local viewport = Camera.ViewportSize
+    local center = Vector2.new(viewport.X * 0.5, viewport.Y * 0.5)
+    local now = os.clock()
+
+    -- alvo travado ainda vale?
+    if locked_player and now < locked_until then
+        local character = locked_player.Character
+        if character then
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid.Health > 0 then
+                local part = get_aim_part(character)
+                if part then
+                    return { player = locked_player, part = part }
+                end
+            end
+        end
+        locked_player = nil
+    end
+
+    local best, best_score = nil, math.huge
+    local cam_pos = Camera.CFrame.Position
+    local look = Camera.CFrame.LookVector
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if is_valid_target(player) then
+            local character = player.Character
+            local part = get_aim_part(character)
+            if part then
+                local screen, on_screen = Camera:WorldToViewportPoint(part.Position)
+                local na_frente = on_screen and screen.Z > 0
+                local aceito, score = false, math.huge
+
+                if na_frente then
+                    -- alvo na tela: limite pelo circulo de FOV em pixels
+                    local px = (Vector2.new(screen.X, screen.Y) - center).Magnitude
+                    if px <= cfg.fov then
+                        aceito = true
+                        score = px
+                    end
+                end
+
+                -- 360 graus: aceita alvo fora da tela (atras, ao lado, acima)
+                if not aceito and cfg.vision_360 then
+                    local d = (part.Position - cam_pos)
+                    local dist = d.Magnitude
+                    if dist > 0.1 then
+                        local dot = look:Dot(d.Unit)
+                        local ang = math.deg(math.acos(math.clamp(dot, -1, 1)))
+                        aceito = true
+                        score = 1e6 + ang
+                    end
+                end
+
+                if aceito and score < best_score then
+                    if is_visible(part, character) or cfg.wall_aim then
+                        best, best_score = { player = player, part = part }, score
+                    end
+                end
+            end
+        end
+    end
+
+    if best then
+        locked_player = best.player
+        locked_until = now + LOCK_HOLD
+    end
+    return best
+end
+
+--------------------------------------------------------------------------
+-- mira
+--------------------------------------------------------------------------
+local function sync_angles()
+    local look = Camera.CFrame.LookVector
+    manual_yaw = math.atan2(-look.X, -look.Z)
+    manual_pitch = math.asin(math.clamp(look.Y, -1, 1))
+end
+
+local function aim_at(part)
+    local desired = CFrame.lookAt(Camera.CFrame.Position, part.Position)
+    if cfg.smoothness <= 0.01 then
+        Camera.CFrame = desired
+    else
+        Camera.CFrame = Camera.CFrame:Lerp(desired, 1 - cfg.smoothness)
+    end
+    sync_angles()
+end
+
+--------------------------------------------------------------------------
+-- tecla de atalho do aimbot
+-- IMPORTANTE: quem alterna e SO o Callback do keybind do menu.
+-- Ja existiu um listener aqui tambem, e os dois alternavam no mesmo
+-- aperto: um ligava e o outro desligava, entao "nada acontecia".
+-- E fica fora: o jogo usa E para interagir.
+--------------------------------------------------------------------------
+STATE.aim.onToggle = STATE.aim.onToggle or function() end
+
+--------------------------------------------------------------------------
+-- loop
+--------------------------------------------------------------------------
+local connection = RunService.RenderStepped:Connect(function()
+    if cfg.show_fov and cfg.enabled then
+        local viewport = Camera.ViewportSize
+        fov_circle.Position = Vector2.new(viewport.X * 0.5, viewport.Y * 0.5)
+        fov_circle.Radius = cfg.fov * 0.5
+        fov_circle.Visible = true
+    else
+        fov_circle.Visible = false
+    end
+
+    if not cfg.enabled then
+        release_camera()
+        return
+    end
+
+    if not Camera or not Camera.Parent then return end
+
+    take_camera()
+
+    local target = find_target()
+    if target then
+        aim_at(target.part)
+    else
+        Camera.CFrame = CFrame.new(Camera.CFrame.Position)
+            * CFrame.fromEulerAnglesYXZ(manual_pitch, manual_yaw, 0)
+    end
+end)
+
+__zyon_on_cleanup(function()
+    if connection then connection:Disconnect() end
+    fov_circle.Visible = false
+    pcall(function() fov_circle:Remove() end)
+    release_camera()
+end)
+
+
+
+
+-- ==========================================================================
+-- INTERFACE
+-- ==========================================================================
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TextService = game:GetService("TextService")
+local GuiService = game:GetService("GuiService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local Theme = {
+	Background = Color3.fromRGB(12, 13, 18),
+	Sidebar    = Color3.fromRGB(16, 17, 24),
+	Card       = Color3.fromRGB(24, 26, 35),
+	CardHover  = Color3.fromRGB(30, 32, 44),
+	Input      = Color3.fromRGB(17, 18, 25),
+	Stroke     = Color3.fromRGB(40, 43, 57),
+	StrokeHi   = Color3.fromRGB(62, 66, 88),
+	Accent     = Color3.fromRGB(116, 124, 255),
+	Accent2    = Color3.fromRGB(176, 112, 255),
+	Text       = Color3.fromRGB(236, 238, 247),
+	SubText    = Color3.fromRGB(135, 141, 162),
+	Success    = Color3.fromRGB(80, 220, 140),
+	Warn       = Color3.fromRGB(255, 190, 80),
+	Danger     = Color3.fromRGB(255, 95, 110),
+	Font       = Enum.Font.GothamMedium,
+	FontBold   = Enum.Font.GothamBold,
+	Speed      = 1,
+}
+
+local Themes = {
+	{ "Indigo",    Color3.fromRGB(116, 124, 255), Color3.fromRGB(176, 112, 255) },
+	{ "Esmeralda", Color3.fromRGB(52, 211, 153),  Color3.fromRGB(56, 189, 248) },
+	{ "Rosa",      Color3.fromRGB(244, 114, 182), Color3.fromRGB(251, 146, 60) },
+	{ "Ambar",     Color3.fromRGB(251, 191, 36),  Color3.fromRGB(244, 114, 82) },
+	{ "Ciano",     Color3.fromRGB(34, 211, 238),  Color3.fromRGB(99, 102, 241) },
+}
+
+local WHITE = Color3.new(1, 1, 1)
+local TOPBAR_H = 46
+local TAB_H, TAB_GAP, TAB_START = 40, 4, 40
+local SIDEBAR_FULL, SIDEBAR_COMPACT = 212, 64
+
+local accA, accB = Instance.new("Color3Value"), Instance.new("Color3Value")
+local binds = {}
+
+local function applyAccent()
+	local a, b = accA.Value, accB.Value
+	for _, fn in ipairs(binds) do fn(a, b) end
+end
+accA.Changed:Connect(applyAccent)
+accB.Changed:Connect(applyAccent)
+
+local function bind(fn)
+	table.insert(binds, fn)
+	fn(accA.Value, accB.Value)
+end
+local function bindColor(inst, prop, second)
+	bind(function(a, b) inst[prop] = second and b or a end)
+end
+local function bindGradient(g, three)
+	bind(function(a, b)
+		if three then
+			g.Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, a),
+				ColorSequenceKeypoint.new(0.5, b),
+				ColorSequenceKeypoint.new(1, a),
+			})
+		else
+			g.Color = ColorSequence.new(a, b)
+		end
+	end)
+end
+
+local function tween(obj, props, time, style, dir)
+	local t = TweenService:Create(obj, TweenInfo.new(
+		(time or 0.25) / Theme.Speed, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out
+	), props)
+	t:Play()
+	return t
+end
+
+local function new(class, props, children)
+	local inst = Instance.new(class)
+	for k, v in pairs(props or {}) do
+		if k ~= "Parent" then inst[k] = v end
+	end
+	for _, child in ipairs(children or {}) do
+		child.Parent = inst
+	end
+	if props and props.Parent then inst.Parent = props.Parent end
+	return inst
+end
+
+local function corner(r) return new("UICorner", { CornerRadius = UDim.new(0, r) }) end
+local function round() return new("UICorner", { CornerRadius = UDim.new(0.5, 0) }) end
+local function stroke(color, t, transparency)
+	return new("UIStroke", {
+		Color = color, Thickness = t or 1, Transparency = transparency or 0,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+end
+local function padding(l, r, t, b)
+	return new("UIPadding", {
+		PaddingLeft = UDim.new(0, l or 0), PaddingRight = UDim.new(0, r or 0),
+		PaddingTop = UDim.new(0, t or 0), PaddingBottom = UDim.new(0, b or 0),
+	})
+end
+
+local function getGuiParent()
+	local ok, ui = pcall(function() return gethui and gethui() end)
+	if ok and ui then return ui end
+	ok, ui = pcall(function() return game:GetService("CoreGui") end)
+	if ok and ui then return ui end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local function getGlobal(name)
+	local ok, v = pcall(function() return getfenv()[name] end)
+	if ok then return v end
+	return nil
+end
+
+local function isPress(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
+end
+local function isMove(input)
+	return input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch
+end
+local function toGui(input)
+	if input.UserInputType == Enum.UserInputType.Touch then
+		return Vector2.new(input.Position.X, input.Position.Y + GuiService:GetGuiInset().Y)
+	end
+	return UserInputService:GetMouseLocation()
+end
+
+local function ripple(parent, mouseX)
+	local relX = mouseX - parent.AbsolutePosition.X
+	local c = new("Frame", {
+		Size = UDim2.fromOffset(0, 0),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, relX, 0.5, 0),
+		BackgroundColor3 = WHITE,
+		BackgroundTransparency = 0.86,
+		BorderSizePixel = 0,
+		Parent = parent,
+	}, { round() })
+	local d = math.max(parent.AbsoluteSize.X, parent.AbsoluteSize.Y) * 2.4
+	tween(c, { Size = UDim2.fromOffset(d, d), BackgroundTransparency = 1 }, 0.6)
+	task.delay(0.65, function() c:Destroy() end)
+end
+
+local function dragArea(hit, onPos)
+	hit.InputBegan:Connect(function(input)
+		if not isPress(input) then return end
+		onPos(toGui(input))
+		local moveConn, endConn
+		moveConn = UserInputService.InputChanged:Connect(function(i)
+			if isMove(i) then onPos(toGui(i)) end
+		end)
+		endConn = UserInputService.InputEnded:Connect(function(i)
+			if isPress(i) then
+				moveConn:Disconnect()
+				endConn:Disconnect()
+			end
+		end)
+	end)
+end
+
+local CONFIG_DIR = "MenuUI_Configs"
+local fsWrite, fsRead = getGlobal("writefile"), getGlobal("readfile")
+local fsIsFile, fsList = getGlobal("isfile"), getGlobal("listfiles")
+local fsMake, fsIsFolder, fsDel = getGlobal("makefolder"), getGlobal("isfolder"), getGlobal("delfile")
+local useFiles = (fsWrite and fsRead and fsIsFile and fsList and fsMake and fsIsFolder) and true or false
+local MemConfigs = {}
+
+local function cleanName(name)
+	name = tostring(name or ""):gsub("[^%w%-_ ]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+	return name
+end
+local function configPath(name) return CONFIG_DIR .. "/" .. name .. ".json" end
+
+local HOLE_B64 = table.concat({
+	"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",
+})
+
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local b64map = {}
+for i = 1, 64 do b64map[string.byte(B64, i)] = i - 1 end
+
+local function b64decode(data)
+	local out, n, bits, nb = {}, 0, 0, 0
+	for i = 1, #data do
+		local v = b64map[string.byte(data, i)]
+		if v then
+			bits = bits * 64 + v
+			nb += 6
+			if nb >= 8 then
+				nb -= 8
+				local p = 2 ^ nb
+				local byte = math.floor(bits / p)
+				bits -= byte * p
+				n += 1
+				out[n] = string.char(byte)
+			end
+		end
+	end
+	return table.concat(out)
+end
+
+local function loadHoleAsset()
+	local wf = getGlobal("writefile")
+	local gca = getGlobal("getcustomasset") or getGlobal("getsynasset")
+	if not (wf and gca) then return nil end
+	local ok, res = pcall(function()
+		wf("MenuUI_hole.png", b64decode(HOLE_B64))
+		return gca("MenuUI_hole.png")
+	end)
+	if ok and res and res ~= "" then return res end
+	return nil
+end
+
+local Library = {}
+Library.__index = Library
+
+function Library.new(title, subtitle)
+	local parent = getGuiParent()
+	local old = parent:FindFirstChild("MenuUI")
+	if old then old:Destroy() end
+
+	table.clear(binds)
+	Theme.Accent, Theme.Accent2 = Themes[1][2], Themes[1][3]
+	accA.Value, accB.Value = Theme.Accent, Theme.Accent2
+
+	local self = setmetatable({
+		Tabs = {}, Connections = {}, Shimmers = {}, Particles = {}, Commands = {}, Keybinds = {}, Flags = {},
+		Open = true, Minimized = false, Maximized = false, Collapsed = false, Ready = false, SplashActive = true,
+		ActiveTab = nil, ToggleKey = Enum.KeyCode.RightShift, Listening = false, Loading = false,
+		BaseT = 0, BorderAnim = true, PalSel = 1, Title = title or "MENU", SidebarW = SIDEBAR_FULL,
+		TipVisible = false,
+	}, Library)
+
+	local gui = new("ScreenGui", {
+		Name = "MenuUI",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = 100,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		Parent = parent,
+	})
+	self.Gui = gui
+
+	local root = new("Frame", {
+		Name = "Root",
+		Size = UDim2.fromOffset(820, 520),
+		Position = UDim2.new(0.5, -410, 0.5, -260),
+		BackgroundTransparency = 1,
+		Parent = gui,
+	}, { corner(13) })
+	local rootStroke = new("UIStroke", {
+		Color = WHITE, Thickness = 1.5, Transparency = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = root,
+	})
+	local strokeGrad = new("UIGradient", { Parent = rootStroke })
+	bindGradient(strokeGrad, true)
+	local scale = new("UIScale", { Scale = 0.9, Parent = root })
+
+	local main = new("CanvasGroup", {
+		Name = "Main",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Theme.Background,
+		BorderSizePixel = 0,
+		GroupTransparency = 1,
+		Parent = root,
+	}, { corner(13) })
+	self.Root, self.RootStroke, self.StrokeGrad, self.Scale, self.Main = root, rootStroke, strokeGrad, scale, main
+
+	local top = new("Frame", {
+		Name = "TopBar",
+		Size = UDim2.new(1, 0, 0, TOPBAR_H),
+		BackgroundColor3 = Theme.Sidebar,
+		BorderSizePixel = 0,
+		Parent = main,
+	})
+	new("Frame", {
+		Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1),
+		BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0, Parent = top,
+	})
+	local sweep = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
+		BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = top,
+	})
+	local sweepGrad = new("UIGradient", {
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1),
+			NumberSequenceKeypoint.new(0.5, 0),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+		Parent = sweep,
+	})
+	bindGradient(sweepGrad)
+
+	local left = new("Frame", {
+		Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X,
+		Position = UDim2.fromOffset(12, 0), BackgroundTransparency = 1, Parent = top,
+	}, {
+		new("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+
+	local burger = new("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundColor3 = Theme.Card, BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(28, 28), LayoutOrder = 0, Parent = left,
+	}, { corner(7) })
+	local bars = {}
+	for i = 0, 2 do
+		bars[i + 1] = new("Frame", {
+			Size = UDim2.fromOffset(12, 2), Position = UDim2.fromOffset(8, 8 + i * 5),
+			BackgroundColor3 = Theme.SubText, BorderSizePixel = 0, Parent = burger,
+		}, { corner(1) })
+	end
+	burger.MouseEnter:Connect(function()
+		tween(burger, { BackgroundTransparency = 0.5 }, 0.15)
+		for _, b in ipairs(bars) do tween(b, { BackgroundColor3 = Theme.Text }, 0.15) end
+	end)
+	burger.MouseLeave:Connect(function()
+		tween(burger, { BackgroundTransparency = 1 }, 0.2)
+		for _, b in ipairs(bars) do tween(b, { BackgroundColor3 = Theme.SubText }, 0.2) end
+	end)
+	burger.MouseButton1Click:Connect(function() self:SetCollapsed(not self.Collapsed) end)
+	self.Bars = bars
+
+	local mark = new("Frame", {
+		Size = UDim2.fromOffset(18, 18), BackgroundColor3 = WHITE, LayoutOrder = 1, Parent = left,
+	}, { corner(5) })
+	local markGrad = new("UIGradient", { Rotation = 45, Parent = mark })
+	bindGradient(markGrad)
+	new("TextLabel", {
+		Text = self.Title, Font = Theme.FontBold, TextSize = 15, TextColor3 = Theme.Text,
+		BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromOffset(0, 20), LayoutOrder = 2, Parent = left,
+	})
+	new("TextLabel", {
+		Text = subtitle or "v4.0", Font = Theme.FontBold, TextSize = 10, TextColor3 = Theme.SubText,
+		BackgroundColor3 = Theme.Card, AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromOffset(0, 18), LayoutOrder = 3, Parent = left,
+	}, { corner(9), stroke(Theme.Stroke), padding(8, 8, 0, 0) })
+
+	self.Breadcrumb = new("TextLabel", {
+		Text = "", Font = Theme.Font, TextSize = 12, TextColor3 = Theme.SubText,
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 20, 0.5, 0), Size = UDim2.fromOffset(170, 20), Parent = top,
+	})
+
+	local searchBtn = new("TextButton", {
+		Text = "", AutoButtonColor = false, Size = UDim2.fromOffset(122, 26),
+		Position = UDim2.new(1, -244, 0, 10), BackgroundColor3 = Theme.Card, Parent = top,
+	}, { corner(8) })
+	local searchStroke = stroke(Theme.Stroke)
+	searchStroke.Parent = searchBtn
+	new("TextLabel", {
+		Text = "Buscar", Font = Theme.Font, TextSize = 12, TextColor3 = Theme.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(10, 0), Size = UDim2.new(0, 50, 1, 0), Parent = searchBtn,
+	})
+	new("TextLabel", {
+		Text = "Ctrl K", Font = Theme.FontBold, TextSize = 9, TextColor3 = Theme.SubText,
+		BackgroundColor3 = Theme.Stroke, AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -6, 0.5, 0), Size = UDim2.fromOffset(40, 16), Parent = searchBtn,
+	}, { corner(5) })
+	searchBtn.MouseEnter:Connect(function()
+		tween(searchBtn, { BackgroundColor3 = Theme.CardHover }, 0.15)
+		tween(searchStroke, { Color = Theme.StrokeHi }, 0.15)
+	end)
+	searchBtn.MouseLeave:Connect(function()
+		tween(searchBtn, { BackgroundColor3 = Theme.Card }, 0.2)
+		tween(searchStroke, { Color = Theme.Stroke }, 0.2)
+	end)
+	searchBtn.MouseButton1Click:Connect(function() self:OpenPalette() end)
+
+	local function topButton(text, xOffset, hoverColor, callback, tip)
+		local b = new("TextButton", {
+			Text = text, Font = Theme.FontBold, TextSize = 15, TextColor3 = Theme.SubText,
+			BackgroundColor3 = hoverColor, BackgroundTransparency = 1, AutoButtonColor = false,
+			Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, xOffset, 0, 9), Parent = top,
+		}, { corner(7) })
+		b.MouseEnter:Connect(function() tween(b, { BackgroundTransparency = 0.8, TextColor3 = Theme.Text }, 0.15) end)
+		b.MouseLeave:Connect(function() tween(b, { BackgroundTransparency = 1, TextColor3 = Theme.SubText }, 0.2) end)
+		b.MouseButton1Down:Connect(function()
+			tween(b, { Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, xOffset + 2, 0, 11) }, 0.08)
+		end)
+		b.MouseButton1Up:Connect(function()
+			tween(b, { Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, xOffset, 0, 9) }, 0.2, Enum.EasingStyle.Back)
+		end)
+		b.MouseButton1Click:Connect(callback)
+		if tip then self:AttachTooltip(b, tip) end
+		return b
+	end
+	topButton("", -40, Theme.Danger, function() self:Hide() end, function()
+		return "Ocultar menu (" .. self.ToggleKey.Name .. " para reabrir)"
+	end)
+	local maxBtn = topButton("", -72, Theme.Accent, function() self:ToggleMaximize() end, "Maximizar / restaurar")
+	local maxIcon = new("Frame", {
+		Size = UDim2.fromOffset(10, 10), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		BackgroundTransparency = 1, Parent = maxBtn,
+	}, { corner(2) })
+	local maxStroke = new("UIStroke", { Color = Theme.SubText, Thickness = 1.5, Parent = maxIcon })
+	maxBtn.MouseEnter:Connect(function() tween(maxStroke, { Color = Theme.Text }, 0.15) end)
+	maxBtn.MouseLeave:Connect(function() tween(maxStroke, { Color = Theme.SubText }, 0.2) end)
+	topButton("", -104, Theme.Accent, function() self:Minimize() end, "Minimizar para orbe")
+
+	local sidebar = new("Frame", {
+		Name = "Sidebar",
+		Size = UDim2.new(0, SIDEBAR_FULL, 1, -TOPBAR_H),
+		Position = UDim2.fromOffset(0, TOPBAR_H),
+		BackgroundColor3 = Theme.Sidebar, BorderSizePixel = 0, ClipsDescendants = true, Parent = main,
+	})
+	new("Frame", {
+		Size = UDim2.new(0, 1, 1, 0), Position = UDim2.new(1, -1, 0, 0),
+		BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0, ZIndex = 5, Parent = sidebar,
+	})
+	self.NavLabel = new("TextLabel", {
+		Text = "NAVEGACAO", Font = Theme.FontBold, TextSize = 10, TextColor3 = Theme.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(20, 14), Size = UDim2.fromOffset(140, 16), Parent = sidebar,
+	})
+	self.Sidebar = sidebar
+
+	local pill = new("CanvasGroup", {
+		Name = "Pill", Size = UDim2.fromOffset(SIDEBAR_FULL - 16, TAB_H),
+		Position = UDim2.fromOffset(8, TAB_START), BackgroundColor3 = WHITE,
+		GroupTransparency = 1, ZIndex = 1, Parent = sidebar,
+	}, { corner(9) })
+	local pillGrad = new("UIGradient", { Parent = pill })
+	bind(function(a) pillGrad.Color = ColorSequence.new(a:Lerp(Theme.Card, 0.78), Theme.Card) end)
+	local pillBar = new("Frame", {
+		Size = UDim2.fromOffset(3, 18), AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5), BorderSizePixel = 0, Parent = pill,
+	}, { corner(2) })
+	bindColor(pillBar, "BackgroundColor3")
+	self.Pill = pill
+
+	local footer = new("CanvasGroup", {
+		Name = "Footer", Size = UDim2.fromOffset(SIDEBAR_FULL - 16, 50),
+		Position = UDim2.new(0, 8, 1, -58), BackgroundColor3 = Theme.Card,
+		GroupTransparency = 1, ZIndex = 2, Parent = sidebar,
+	}, { corner(9) })
+	local avatar = new("ImageLabel", {
+		Size = UDim2.fromOffset(30, 30), Position = UDim2.fromOffset(9, 10),
+		BackgroundColor3 = Theme.Stroke, Image = "", Parent = footer,
+	}, { round() })
+	if LocalPlayer then
+		avatar.Image = string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", LocalPlayer.UserId)
+	end
+	local dot = new("Frame", {
+		Size = UDim2.fromOffset(9, 9), Position = UDim2.fromOffset(31, 31),
+		BackgroundColor3 = Theme.Success, ZIndex = 3, Parent = footer,
+	}, { round(), stroke(Theme.Card, 2) })
+	new("TextLabel", {
+		Text = (LocalPlayer and LocalPlayer.DisplayName) or "Player", Font = Theme.FontBold, TextSize = 12,
+		TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(48, 9), Size = UDim2.new(1, -56, 0, 16), Parent = footer,
+	})
+	local fpsLabel = new("TextLabel", {
+		Text = "-- FPS", Font = Theme.Font, TextSize = 11, TextColor3 = Theme.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(48, 26), Size = UDim2.new(1, -56, 0, 14), Parent = footer,
+	})
+	self.Footer = footer
+
+	local particles = new("Frame", {
+		Name = "Particles", Size = UDim2.new(1, -SIDEBAR_FULL, 1, -TOPBAR_H),
+		Position = UDim2.fromOffset(SIDEBAR_FULL, TOPBAR_H), BackgroundTransparency = 1,
+		ClipsDescendants = true, ZIndex = 1, Parent = main,
+	})
+	self.ParticleFrame = particles
+	for _ = 1, 26 do
+		local size = math.random(2, 4)
+		local p = new("Frame", {
+			Size = UDim2.fromOffset(size, size), BackgroundTransparency = 0.55 + math.random() * 0.4,
+			BorderSizePixel = 0, Parent = particles,
+		}, { round() })
+		bindColor(p, "BackgroundColor3")
+		table.insert(self.Particles, {
+			f = p, x = math.random(), y = math.random(),
+			vx = (math.random() - 0.5) * 0.02, vy = -(0.01 + math.random() * 0.03),
+		})
+	end
+
+	self.Pages = new("Frame", {
+		Name = "Pages", Size = UDim2.new(1, -SIDEBAR_FULL, 1, -TOPBAR_H),
+		Position = UDim2.fromOffset(SIDEBAR_FULL, TOPBAR_H), BackgroundTransparency = 1,
+		ClipsDescendants = true, ZIndex = 2, Parent = main,
+	})
+
+	local grip = new("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -22, 1, -22), ZIndex = 20, Parent = main,
+	})
+	for i = 0, 2 do
+		for j = 0, i do
+			new("Frame", {
+				Size = UDim2.fromOffset(2, 2), Position = UDim2.fromOffset(16 - j * 4, 8 + (i - j) * 4),
+				BackgroundColor3 = Theme.StrokeHi, BorderSizePixel = 0, ZIndex = 20, Parent = grip,
+			}, { round() })
+		end
+	end
+
+	self.ToastHolder = new("Frame", {
+		Name = "Toasts", AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -20, 1, -20),
+		Size = UDim2.new(0, 300, 1, -40), BackgroundTransparency = 1, Parent = gui,
+	}, {
+		new("UIListLayout", {
+			VerticalAlignment = Enum.VerticalAlignment.Bottom, Padding = UDim.new(0, 8),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+	self._toastCount = 0
+
+	local tip = new("CanvasGroup", {
+		Name = "Tooltip", AutomaticSize = Enum.AutomaticSize.XY, Size = UDim2.fromOffset(0, 0),
+		BackgroundColor3 = Color3.fromRGB(30, 32, 44), GroupTransparency = 1, Visible = false,
+		ZIndex = 300, Parent = gui,
+	}, { corner(7), padding(10, 10, 6, 6), stroke(Theme.StrokeHi) })
+	local tipLabel = new("TextLabel", {
+		Text = "", Font = Theme.Font, TextSize = 12, TextColor3 = Theme.Text,
+		BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.XY, Size = UDim2.fromOffset(0, 0), Parent = tip,
+	})
+	self.Tip, self.TipLabel = tip, tipLabel
+
+	local pal = new("CanvasGroup", {
+		Name = "Palette", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.45, GroupTransparency = 1, Visible = false, ZIndex = 90, Parent = main,
+	})
+	local backdrop = new("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = pal,
+	})
+	local box = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 64), Size = UDim2.fromOffset(400, 100),
+		BackgroundColor3 = Theme.Card, ClipsDescendants = true, Active = true, Parent = pal,
+	}, { corner(12) })
+	local boxStroke = stroke(Theme.StrokeHi)
+	boxStroke.Parent = box
+	local input = new("TextBox", {
+		Text = "", PlaceholderText = "Digite um comando ou o nome de uma aba...",
+		PlaceholderColor3 = Theme.SubText, TextColor3 = Theme.Text, Font = Theme.Font, TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -32, 0, 46), Parent = box,
+	})
+	new("Frame", {
+		Position = UDim2.fromOffset(0, 46), Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0, Parent = box,
+	})
+	local listFrame = new("Frame", {
+		Position = UDim2.fromOffset(0, 47), Size = UDim2.new(1, 0, 1, -47), BackgroundTransparency = 1, Parent = box,
+	}, {
+		padding(8, 8, 6, 4),
+		new("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+	local rows = {}
+	for i = 1, 7 do
+		local f = new("TextButton", {
+			Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 32),
+			BackgroundColor3 = Color3.fromRGB(44, 47, 66), BackgroundTransparency = 1, LayoutOrder = i, Parent = listFrame,
+		}, { corner(7) })
+		local lab = new("TextLabel", {
+			Text = "", Font = Theme.Font, TextSize = 13, TextColor3 = Theme.Text,
+			TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -100, 1, 0), Parent = f,
+		})
+		local hint = new("TextLabel", {
+			Text = "", Font = Theme.FontBold, TextSize = 10, TextColor3 = Theme.SubText,
+			TextXAlignment = Enum.TextXAlignment.Right, BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0),
+			Size = UDim2.fromOffset(80, 16), Parent = f,
+		})
+		f.MouseEnter:Connect(function() self.PalSel = i; self:_paletteStyle() end)
+		f.InputBegan:Connect(function(inp)
+			if isPress(inp) then self:_paletteRun(i) end
+		end)
+		rows[i] = { Frame = f, Label = lab, Hint = hint }
+	end
+	self.Pal = { Group = pal, Box = box, Input = input, Rows = rows, List = {}, Open = false }
+
+	backdrop.MouseButton1Click:Connect(function() self:ClosePalette() end)
+	input:GetPropertyChangedSignal("Text"):Connect(function()
+		self.PalSel = 1
+		self:_paletteRefresh()
+	end)
+	input.FocusLost:Connect(function(enter)
+		if enter then
+			self:_paletteRun(self.PalSel)
+		else
+			task.delay(0.2, function()
+				if self.Pal.Open and not input:IsFocused() then self:ClosePalette() end
+			end)
+		end
+	end)
+
+	local orb = new("TextButton", {
+		Name = "Orb", Text = "", AutoButtonColor = false, AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 56, 1, -64), Size = UDim2.fromOffset(0, 0),
+		BackgroundColor3 = WHITE, Visible = false, Parent = gui,
+	}, { round() })
+	local orbGrad = new("UIGradient", { Rotation = 45, Parent = orb })
+	bindGradient(orbGrad)
+	local orbRing = new("UIStroke", { Color = WHITE, Thickness = 2, Transparency = 0.5, Parent = orb })
+	bindColor(orbRing, "Color")
+	new("TextLabel", {
+		Text = string.upper(string.sub(self.Title, 1, 1)), Font = Theme.FontBold, TextSize = 20,
+		TextColor3 = WHITE, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = orb,
+	})
+	self.Orb, self.OrbRing = orb, orbRing
+	orb.MouseEnter:Connect(function()
+		if self.Minimized then tween(orb, { Size = UDim2.fromOffset(54, 54) }, 0.25, Enum.EasingStyle.Back) end
+	end)
+	orb.MouseLeave:Connect(function()
+		if self.Minimized then tween(orb, { Size = UDim2.fromOffset(48, 48) }, 0.25) end
+	end)
+	orb.MouseButton1Click:Connect(function() self:Toggle(true) end)
+
+	local function beginDrag(kind, inp)
+		self._drag = { kind = kind, m = inp.Position, pos = root.Position, size = root.Size }
+	end
+	top.InputBegan:Connect(function(inp) if isPress(inp) then beginDrag("move", inp) end end)
+	grip.InputBegan:Connect(function(inp) if isPress(inp) then beginDrag("resize", inp) end end)
+	table.insert(self.Connections, UserInputService.InputEnded:Connect(function(inp)
+		if isPress(inp) then self._drag = nil end
+	end))
+	table.insert(self.Connections, UserInputService.InputChanged:Connect(function(inp)
+		local d = self._drag
+		if not d or not isMove(inp) then return end
+		local delta = inp.Position - d.m
+		if d.kind == "move" then
+			tween(root, {
+				Position = UDim2.new(d.pos.X.Scale, d.pos.X.Offset + delta.X, d.pos.Y.Scale, d.pos.Y.Offset + delta.Y),
+			}, 0.08, Enum.EasingStyle.Quad)
+		else
+			root.Size = UDim2.fromOffset(
+				math.clamp(d.size.X.Offset + delta.X, 740, 1400),
+				math.clamp(d.size.Y.Offset + delta.Y, 460, 900)
+			)
+		end
+	end))
+
+	table.insert(self.Connections, UserInputService.InputBegan:Connect(function(inp, processed)
+		if inp.UserInputType ~= Enum.UserInputType.Keyboard then return end
+		local kc = inp.KeyCode
+		local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+
+		if ctrl and kc == Enum.KeyCode.K then
+			if self.Pal.Open then self:ClosePalette() elseif self.Open then self:OpenPalette() end
+			return
+		end
+		if self.Pal.Open then
+			if kc == Enum.KeyCode.Down then
+				self.PalSel = math.min(self.PalSel + 1, math.max(#self.Pal.List, 1)); self:_paletteStyle()
+			elseif kc == Enum.KeyCode.Up then
+				self.PalSel = math.max(self.PalSel - 1, 1); self:_paletteStyle()
+			end
+			return
+		end
+		-- Listening trava se um remapeamento der erro no meio; auto-destrava em 3s
+		if self.Listening then
+			if not self._listenAt or (os.clock() - self._listenAt) > 3 then
+				self.Listening = false
+			else
+				return
+			end
+		end
+		-- o jogo consome varias teclas (E pega item, F abre porta).
+		-- keybind customizado roda mesmo assim; atalho de menu continua respeitando processed.
+		if processed and kc ~= self.ToggleKey then
+			local ehKeybind = false
+			for _, kb in ipairs(self.Keybinds) do
+				if kb.Value == kc then ehKeybind = true break end
+			end
+			if not ehKeybind then return end
+		end
+		if ctrl and kc == Enum.KeyCode.B and self.Open then
+			self:SetCollapsed(not self.Collapsed)
+			return
+		end
+		if kc == self.ToggleKey then
+			self:Toggle()
+			return
+		end
+		for _, kb in ipairs(self.Keybinds) do
+			if kb.Value == kc and kb.Callback then task.spawn(kb.Callback) end
+		end
+	end))
+
+	local splash = new("Frame", {
+		Name = "Splash", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+		BorderSizePixel = 0, ZIndex = 100, Parent = gui,
+	})
+	local stage = new("Frame", {
+		Size = UDim2.fromOffset(0, 0), AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1, Parent = splash,
+	})
+	local function circle(size, color, transp, z)
+		return new("Frame", {
+			Size = UDim2.fromOffset(size, size), AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromOffset(0, 0), BackgroundColor3 = color, BackgroundTransparency = transp,
+			BorderSizePixel = 0, ZIndex = z or 1, Parent = stage,
+		}, { round() })
+	end
+
+	local glows = {}
+	for i, k in ipairs({ 1, 0.72, 0.5, 0.34 }) do
+		glows[i] = { f = circle(0, Theme.Accent, 0.93, 1), k = k }
+	end
+	local function setGlow(size, transp, time, style, dir)
+		for _, g in ipairs(glows) do
+			tween(g.f, {
+				Size = UDim2.fromOffset(size * g.k, size * g.k), BackgroundTransparency = transp,
+			}, time, style, dir)
+		end
+	end
+
+	local holeAsset = loadHoleAsset()
+	local core = circle(0, Color3.new(0, 0, 0), 0, 4)
+	local coreStroke = new("UIStroke", { Color = WHITE, Thickness = 2, Transparency = holeAsset and 1 or 0.3, Parent = core })
+	local holeImg
+	if holeAsset then
+		holeImg = new("ImageLabel", {
+			Size = UDim2.fromScale(3.4, 3.4), AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1, Image = holeAsset,
+			ImageTransparency = 1, Rotation = -16, ZIndex = 2, Parent = core,
+		})
+	end
+
+	local function pulse(color, size0, size1, time)
+		local f = new("Frame", {
+			Size = UDim2.fromOffset(size0, size0), AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromOffset(0, 0), BackgroundTransparency = 1, ZIndex = 4, Parent = stage,
+		}, { round() })
+		local st = new("UIStroke", { Color = color, Thickness = 2.5, Parent = f })
+		tween(f, { Size = UDim2.fromOffset(size1, size1) }, time, Enum.EasingStyle.Quad)
+		tween(st, { Transparency = 1, Thickness = 0.5 }, time, Enum.EasingStyle.Quad)
+		task.delay(time + 0.05, function() f:Destroy() end)
+	end
+
+	local rings = {}
+	local function addRing(w, h, thick, speed, tilt)
+		local f = new("Frame", {
+			Size = UDim2.fromOffset(0, 0), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(0, 0),
+			BackgroundTransparency = 1, Rotation = tilt, ZIndex = 2, Parent = stage,
+		}, { round() })
+		local st = new("UIStroke", {
+			Color = WHITE, Thickness = thick, Transparency = 0,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = f,
+		})
+		local g = new("UIGradient", {
+			Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Theme.Accent),
+				ColorSequenceKeypoint.new(0.5, WHITE),
+				ColorSequenceKeypoint.new(1, Theme.Accent2),
+			}),
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0),
+				NumberSequenceKeypoint.new(0.35, 0.2),
+				NumberSequenceKeypoint.new(0.5, 1),
+				NumberSequenceKeypoint.new(0.8, 0.3),
+				NumberSequenceKeypoint.new(1, 0),
+			}),
+			Parent = st,
+		})
+		table.insert(rings, { f = f, s = st, g = g, w = w, h = h, speed = speed })
+	end
+	if not holeAsset then
+		addRing(250, 70, 1.5, -150, -16)
+		addRing(120, 120, 1.5, 380, 0)
+	end
+
+	local parts = {}
+	for i = 1, 40 do
+		local sz = math.random(2, 4)
+		local color = (i % 3 == 0) and Theme.Accent2 or ((i % 3 == 1) and Theme.Accent or WHITE)
+		local f = circle(sz, color, 0.1, 2)
+		parts[i] = { f = f, r = 60 + math.random() * 220, a = math.random() * math.pi * 2, vr = 0 }
+	end
+
+	local function C(r, g, b) return Color3.fromRGB(r, g, b) end
+	local function bands(list)
+		local keys = {}
+		for i, c in ipairs(list) do
+			keys[i] = ColorSequenceKeypoint.new((i - 1) / (#list - 1), c)
+		end
+		return ColorSequence.new(keys)
+	end
+	local planetDefs = {
+		{ name = "Mercurio", r = 138, sz = 8, rot = 40, glow = C(190, 185, 178),
+		  col = bands({ C(176, 170, 164), C(120, 115, 110), C(160, 154, 148), C(104, 100, 96) }) },
+		{ name = "Venus", r = 162, sz = 13, rot = 90, glow = C(240, 205, 130),
+		  col = bands({ C(244, 222, 160), C(214, 170, 96), C(240, 210, 140), C(200, 150, 84), C(236, 204, 132) }) },
+		{ name = "Terra", r = 188, sz = 14, rot = 25, glow = C(90, 160, 255),
+		  col = bands({ C(32, 88, 196), C(70, 140, 92), C(36, 98, 206), C(210, 228, 245), C(26, 78, 178) }) },
+		{ name = "Marte", r = 214, sz = 10, rot = 70, glow = C(230, 110, 70),
+		  col = bands({ C(214, 100, 62), C(160, 64, 40), C(226, 120, 78), C(140, 54, 34) }) },
+		{ name = "Jupiter", r = 244, sz = 28, rot = 90, glow = C(230, 170, 120),
+		  col = bands({ C(228, 206, 176), C(176, 120, 80), C(238, 220, 196), C(150, 96, 64), C(226, 196, 160), C(184, 130, 92), C(232, 212, 186) }) },
+		{ name = "Saturno", r = 276, sz = 23, rot = 90, glow = C(236, 214, 150), ring = C(224, 200, 150),
+		  col = bands({ C(236, 218, 170), C(204, 176, 120), C(240, 224, 180), C(196, 166, 112) }) },
+		{ name = "Urano", r = 304, sz = 17, rot = 90, glow = C(130, 220, 230), ring = C(150, 200, 210),
+		  col = bands({ C(156, 228, 236), C(110, 200, 214), C(166, 232, 240) }) },
+		{ name = "Netuno", r = 330, sz = 16, rot = 60, glow = C(70, 100, 240),
+		  col = bands({ C(52, 90, 220), C(34, 56, 160), C(70, 112, 236), C(30, 50, 150) }) },
+	}
+	local planets = {}
+	for i, d in ipairs(planetDefs) do
+		local shade = new("Frame", {
+			Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, ZIndex = 2,
+		}, {
+			round(),
+			new("UIGradient", {
+				Rotation = 40,
+				Transparency = NumberSequence.new({
+					NumberSequenceKeypoint.new(0, 1),
+					NumberSequenceKeypoint.new(0.45, 0.82),
+					NumberSequenceKeypoint.new(1, 0.08),
+				}),
+			}),
+		})
+		local f = new("Frame", {
+			Size = UDim2.fromOffset(0, 0), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(0, 0),
+			BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 5, Parent = stage,
+		}, { round(), new("UIGradient", { Rotation = d.rot, Color = d.col }) })
+		shade.Parent = f
+		local ringStrokes
+		if d.ring then
+			local saturn = d.name == "Saturno"
+			local holder = new("Frame", {
+				Size = UDim2.fromScale(saturn and 2.6 or 2.1, saturn and 0.7 or 0.56), AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1, Rotation = saturn and -22 or -75,
+				ZIndex = 3, Parent = f,
+			})
+			ringStrokes = {}
+			local list = saturn and {
+				{ 1.00, 1.0, 0.60, C(176, 152, 112) },
+				{ 0.93, 2.6, 0.18, C(226, 206, 160) },
+				{ 0.84, 1.8, 0.30, C(204, 180, 134) },
+				{ 0.79, 0.8, 0.85, C(150, 130, 96) },
+				{ 0.72, 2.2, 0.15, C(238, 222, 180) },
+				{ 0.62, 1.4, 0.40, C(190, 166, 124) },
+			} or {
+				{ 1.00, 1.0, 0.45, d.ring },
+				{ 0.90, 1.4, 0.25, C(190, 230, 238) },
+				{ 0.82, 0.8, 0.55, d.ring },
+			}
+			for _, rd in ipairs(list) do
+				local ef = new("Frame", {
+					Size = UDim2.fromScale(rd[1], rd[1]), AnchorPoint = Vector2.new(0.5, 0.5),
+					Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1, Parent = holder,
+				}, { round() })
+				local st = new("UIStroke", { Color = rd[4], Thickness = rd[2], Transparency = rd[3], Parent = ef })
+				new("UIGradient", {
+					Rotation = 90,
+					Transparency = NumberSequence.new({
+						NumberSequenceKeypoint.new(0, 0.62),
+						NumberSequenceKeypoint.new(0.45, 0.2),
+						NumberSequenceKeypoint.new(1, 0),
+					}),
+					Parent = st,
+				})
+				table.insert(ringStrokes, { st = st, base = rd[3] })
+			end
+		end
+		planets[i] = {
+			f = f, rs = ringStrokes, shade = shade, sz = d.sz, r = d.r, a = i * 0.8 + math.random() * 0.5,
+			state = "orbit", vr = 0, swallowed = false,
+		}
+	end
+
+	local stars = {}
+	local starCols = { WHITE, C(200, 215, 255), C(255, 232, 205) }
+	for i = 1, 70 do
+		local f = new("Frame", {
+			Size = UDim2.fromOffset(2, 2), AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = starCols[i % 3 + 1],
+			BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 1, Parent = stage,
+		}, { round() })
+		stars[i] = { f = f, r = 60 + math.random() * 440, a = math.random() * math.pi * 2, b = 0.45 + math.random() * 0.55, w = math.random(1, 2) }
+	end
+
+	local sparks = {}
+	local sparkCols = { WHITE, C(255, 214, 140), C(255, 160, 80), C(255, 120, 60) }
+	for i = 1, 70 do
+		local f = new("Frame", {
+			Size = UDim2.fromOffset(0, 0), AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = sparkCols[i % 4 + 1],
+			BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 7, Parent = stage,
+		}, { round() })
+		sparks[i] = { f = f, a = 0, r = 0, v = 0, w = math.random(2, 4), life = 1 }
+	end
+
+	local spots = {}
+	if holeAsset then
+		for i = 1, 16 do
+			local f = new("Frame", {
+				Size = UDim2.fromOffset(0, 0), AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = C(255, 226, 172),
+				BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 6, Parent = stage,
+			}, { round() })
+			spots[i] = { f = f, a = math.random() * math.pi * 2, R = 1.7 + math.random() * 1.05, vis = 0 }
+		end
+	end
+
+	local flash = new("Frame", {
+		Size = UDim2.fromScale(1, 1), BackgroundColor3 = WHITE, BackgroundTransparency = 1,
+		BorderSizePixel = 0, ZIndex = 50, Parent = splash,
+	})
+
+	local status = new("TextLabel", {
+		Text = "", Font = Theme.Font, TextSize = 13, TextColor3 = Theme.Text,
+		TextTransparency = 1, TextStrokeTransparency = 1, TextStrokeColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 175), Size = UDim2.fromOffset(360, 18), ZIndex = 6, Parent = splash,
+	})
+
+	local phase, t0, shake = "gather", os.clock(), 0
+	local TILT = math.rad(-16)
+	local cosT, sinT = math.cos(TILT), math.sin(TILT)
+	local splashAnim
+	splashAnim = function(dt, t)
+		local el = t - t0
+		local mul = 1 + math.min(el / 2.6, 1) ^ 2 * 4
+		if phase == "collapse" then mul *= 2.5 end
+
+		for _, r in ipairs(rings) do
+			r.g.Rotation = (r.g.Rotation + r.speed * mul * dt) % 360
+		end
+
+		local appear = math.clamp((el - 0.9) * 1.5, 0, 1)
+		if phase == "explode" or phase == "done" then appear = 0 end
+
+		for _, st in ipairs(stars) do
+			if phase == "explode" or phase == "done" then
+				st.f.BackgroundTransparency = math.min(1, st.f.BackgroundTransparency + dt * 4)
+			else
+				local speed = (40 + 26000 / math.max(st.r, 50)) * mul * 0.5
+				st.r -= speed * dt
+				if st.r < 40 then
+					st.r = 400 + math.random() * 160
+					st.a = math.random() * math.pi * 2
+				end
+				local fadeIn = math.clamp((470 - st.r) / 150, 0, 1)
+				local fadeOut = math.clamp((st.r - 40) / 60, 0, 1)
+				local len = math.clamp(speed * 0.045, 2, 18)
+				st.f.Size = UDim2.fromOffset(len, st.w)
+				st.f.Rotation = math.deg(st.a)
+				st.f.Position = UDim2.fromOffset(math.cos(st.a) * st.r, math.sin(st.a) * st.r)
+				st.f.BackgroundTransparency = 1 - fadeIn * fadeOut * st.b * math.clamp(el * 1.2, 0, 1) * 0.9
+			end
+		end
+
+		if phase == "explode" then
+			for _, sp in ipairs(sparks) do
+				sp.v *= math.max(0, 1 - 1.5 * dt)
+				sp.r += sp.v * dt
+				sp.life = math.max(0, sp.life - dt * 0.9)
+				local len = math.clamp(sp.v * 0.05, 3, 46)
+				sp.f.Size = UDim2.fromOffset(len, sp.w * sp.life + 0.5)
+				sp.f.Rotation = math.deg(sp.a)
+				sp.f.Position = UDim2.fromOffset(math.cos(sp.a) * sp.r, math.sin(sp.a) * sp.r)
+				sp.f.BackgroundTransparency = 1 - sp.life
+			end
+		end
+
+		if #spots > 0 then
+			local unit = core.AbsoluteSize.X * 0.586
+			for _, sp in ipairs(spots) do
+				sp.a += dt * 1.9 * (1.7 / sp.R) ^ 1.5 * math.min(mul, 3)
+				local ca, sa = math.cos(sp.a), math.sin(sp.a)
+				local x0, y0 = ca * sp.R * unit, sa * sp.R * unit * 0.15
+				sp.f.Position = UDim2.fromOffset(x0 * cosT - y0 * sinT, x0 * sinT + y0 * cosT)
+				local hidden = sa < 0 and math.abs(ca * sp.R) < 1.08
+				local target = hidden and 0 or appear
+				sp.vis += (target - sp.vis) * math.min(dt * 12, 1)
+				local tx = -sa * cosT - ca * 0.15 * sinT
+				local ty = -sa * sinT + ca * 0.15 * cosT
+				sp.f.Rotation = math.deg(math.atan2(ty, tx))
+				sp.f.Size = UDim2.fromOffset(math.clamp(unit * 0.38, 0, 34), math.clamp(unit * 0.05, 0, 5))
+				sp.f.BackgroundTransparency = 1 - sp.vis * (0.45 + 0.45 * ca) * 0.95
+			end
+		end
+
+		for i, pl in ipairs(planets) do
+			if pl.state ~= "gone" then
+				local w = 2.4 * (120 / math.max(pl.r, 30)) ^ 1.4
+				pl.a += dt * w * (pl.state == "fall" and 1.5 or 1) * math.min(mul, 3)
+				if pl.state == "fall" then
+					pl.vr += (260 + 18000 / math.max(pl.r, 40)) * dt
+					pl.r -= pl.vr * dt
+					if pl.r <= 24 then
+						pl.state = "gone"
+						pl.f.Visible = false
+						pl.swallowed = true
+					end
+				end
+				if pl.state ~= "gone" then
+					local x0, y0 = math.cos(pl.a) * pl.r, math.sin(pl.a) * pl.r * 0.38
+					pl.f.Position = UDim2.fromOffset(x0 * cosT - y0 * sinT, x0 * sinT + y0 * cosT)
+					pl.f.ZIndex = (math.sin(pl.a) > 0) and 5 or 3
+					local grow = math.clamp((el - 0.25 - i * 0.1) * 2.5, 0, 1)
+					local k = (pl.state == "fall") and math.clamp((pl.r - 24) / 80, 0, 1) or 1
+					local sz = pl.sz * grow * (0.3 + 0.7 * k)
+					pl.f.Size = UDim2.fromOffset(sz, sz)
+					pl.f.BackgroundTransparency = (1 - k) * 0.8
+					pl.shade.BackgroundTransparency = (1 - k) * 0.8
+					if pl.rs then
+						for _, rr in ipairs(pl.rs) do rr.st.Transparency = 1 - (1 - rr.base) * k end
+					end
+				end
+			end
+		end
+
+		for _, p in ipairs(parts) do
+			if phase == "explode" then
+				p.r += p.vr * dt
+				p.vr *= math.max(0, 1 - 1.1 * dt)
+				p.f.BackgroundTransparency = math.min(1, p.f.BackgroundTransparency + dt * 0.8)
+				p.f.Position = UDim2.fromOffset(math.cos(p.a) * p.r, math.sin(p.a) * p.r)
+			elseif phase ~= "done" then
+				p.a += dt * (95 / math.max(p.r, 24)) * mul
+				p.r -= dt * (30 + 5200 / math.max(p.r, 30)) * mul * 0.55
+				if p.r < 26 then
+					p.r = 190 + math.random() * 90
+					p.a = math.random() * math.pi * 2
+				end
+				local x0, y0 = math.cos(p.a) * p.r, math.sin(p.a) * p.r * 0.38
+				p.f.Position = UDim2.fromOffset(x0 * cosT - y0 * sinT, x0 * sinT + y0 * cosT)
+				p.f.BackgroundTransparency = math.clamp(0.1 + (1 - math.clamp((p.r - 26) / 70, 0, 1)), 0, 1)
+			end
+		end
+
+		if shake > 0.05 then
+			stage.Position = UDim2.new(0.5, (math.random() - 0.5) * 2 * shake, 0.5, (math.random() - 0.5) * 2 * shake)
+			if phase ~= "collapse" then shake *= math.max(0, 1 - 5 * dt) end
+		else
+			stage.Position = UDim2.fromScale(0.5, 0.5)
+		end
+	end
+
+	local frames, acc = 0, 0
+	table.insert(self.Connections, RunService.Heartbeat:Connect(function(dt)
+		local t = os.clock()
+		sweepGrad.Offset = Vector2.new(-1 + (t * 0.6) % 2, 0)
+		if self.BorderAnim then strokeGrad.Rotation = (t * 70) % 360 end
+		for _, s in ipairs(self.Shimmers) do
+			s.g.Offset = Vector2.new(-1 + (t * 0.8 + s.p) % 2, 0)
+		end
+		dot.BackgroundTransparency = 0.3 + 0.3 * math.sin(t * 3)
+		if self.SplashActive then splashAnim(dt, t) end
+		if self.Minimized then
+			orbRing.Transparency = 0.45 + 0.35 * math.sin(t * 3)
+			orbRing.Thickness = 2 + 1.5 * (0.5 + 0.5 * math.sin(t * 3))
+		end
+		if particles.Visible and self.Open then
+			for _, p in ipairs(self.Particles) do
+				p.x += p.vx * dt
+				p.y += p.vy * dt
+				if p.y < -0.02 then p.y = 1.02; p.x = math.random() end
+				if p.x < 0 then p.x = 1 elseif p.x > 1 then p.x = 0 end
+				p.f.Position = UDim2.fromScale(p.x, p.y)
+			end
+		end
+		if self.TipVisible then
+			local m = UserInputService:GetMouseLocation()
+			local cam = workspace.CurrentCamera
+			local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+			local x = math.min(m.X + 14, vp.X - tip.AbsoluteSize.X - 8)
+			local y = math.min(m.Y + 18, vp.Y - tip.AbsoluteSize.Y - 8)
+			tip.Position = UDim2.fromOffset(x, y)
+		end
+		frames += 1
+		acc += dt
+		if acc >= 0.5 then
+			fpsLabel.Text = string.format("%d FPS", math.floor(frames / acc + 0.5))
+			frames, acc = 0, 0
+		end
+	end))
+
+	task.spawn(function()
+		t0 = os.clock()
+
+		tween(core, { Size = UDim2.fromOffset(78, 78) }, 1.2, Enum.EasingStyle.Back)
+		if holeImg then tween(holeImg, { ImageTransparency = 0 }, 0.9) end
+		setGlow(340, 0.93, 1.6)
+		for i, r in ipairs(rings) do
+			task.delay(0.12 * i, function()
+				tween(r.f, { Size = UDim2.fromOffset(r.w, r.h) }, 1.1, Enum.EasingStyle.Back)
+			end)
+		end
+		tween(status, { TextTransparency = 0, TextStrokeTransparency = 0.55 }, 0.6)
+		status.Text = "Iniciando orbita..."
+		task.wait(1.0)
+
+		local base = 78
+		for i, pl in ipairs(planets) do
+			if not splash.Parent then return end
+			status.Text = string.format("%s   %d/%d", planetDefs[i].name, i, #planets)
+			pl.state = "fall"
+			task.spawn(function()
+				repeat task.wait() until pl.swallowed or not splash.Parent
+				if not splash.Parent then return end
+				shake = 5
+				base += 3
+				tween(core, { Size = UDim2.fromOffset(base, base) }, 0.45, Enum.EasingStyle.Back)
+				pulse(planetDefs[i].glow, base, base + 160, 0.75)
+			end)
+			task.wait(0.5)
+		end
+		repeat task.wait() until planets[#planets].swallowed or not splash.Parent
+		if not splash.Parent then return end
+		task.wait(0.35)
+
+		phase = "collapse"
+		tween(status, { TextTransparency = 1, TextStrokeTransparency = 1 }, 0.25)
+		shake = 7
+		setGlow(120, 0.8, 0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		tween(core, { Size = UDim2.fromOffset(34, 34) }, 0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		for _, r in ipairs(rings) do
+			tween(r.f, { Size = UDim2.fromOffset(r.w * 0.28, r.h * 0.28) }, 0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		end
+		task.wait(0.6)
+
+		phase = "explode"
+		shake = 22
+		for _, p in ipairs(parts) do
+			p.a = math.random() * math.pi * 2
+			p.r = 20 + math.random() * 30
+			p.vr = 380 + math.random() * 820
+			p.f.BackgroundTransparency = 0
+		end
+		tween(flash, { BackgroundTransparency = 0.3 }, 0.07, Enum.EasingStyle.Linear)
+
+		for _, sp in ipairs(sparks) do
+			sp.a = math.random() * math.pi * 2
+			sp.r = 10 + math.random() * 30
+			sp.v = 500 + math.random() * 1500
+			sp.life = 0.7 + math.random() * 0.3
+		end
+
+		for i = 1, 56 do
+			local ang = (i / 56) * math.pi * 2 + (math.random() - 0.5) * 0.08
+			local L = 260 + math.random() * 520
+			local th = 1.5 + math.random() * 2.5
+			local ray = new("Frame", {
+				Size = UDim2.fromOffset(0, th), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(0, 0),
+				BackgroundColor3 = (i % 3 == 0) and C(255, 190, 120) or WHITE, BackgroundTransparency = 0.05,
+				BorderSizePixel = 0, Rotation = math.deg(ang), ZIndex = 8, Parent = stage,
+			})
+			new("UIGradient", {
+				Transparency = NumberSequence.new({
+					NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.55, 0.35), NumberSequenceKeypoint.new(1, 1),
+				}),
+				Parent = ray,
+			})
+			local dur = 0.3 + math.random() * 0.25
+			tween(ray, {
+				Size = UDim2.fromOffset(L, th * 0.4),
+				Position = UDim2.fromOffset(math.cos(ang) * L / 2, math.sin(ang) * L / 2),
+			}, dur, Enum.EasingStyle.Quint)
+			task.delay(dur * 0.6, function()
+				tween(ray, { BackgroundTransparency = 1 }, 0.4)
+			end)
+			task.delay(dur + 0.5, function() ray:Destroy() end)
+		end
+
+		local orb = circle(30, WHITE, 0, 9)
+		tween(orb, { Size = UDim2.fromOffset(300, 300), BackgroundTransparency = 1 }, 0.55, Enum.EasingStyle.Quad)
+		task.delay(0.6, function() orb:Destroy() end)
+		local orb2 = circle(14, C(255, 200, 130), 0, 9)
+		tween(orb2, { Size = UDim2.fromOffset(160, 160), BackgroundTransparency = 1 }, 0.4, Enum.EasingStyle.Quad)
+		task.delay(0.45, function() orb2:Destroy() end)
+
+		core.BackgroundColor3 = WHITE
+		if holeImg then
+			holeImg.ImageColor3 = WHITE
+			tween(holeImg, { ImageTransparency = 1 }, 0.35, Enum.EasingStyle.Quad)
+		end
+		tween(core, { Size = UDim2.fromOffset(150, 150), BackgroundTransparency = 1 }, 0.4, Enum.EasingStyle.Quad)
+
+		setGlow(900, 1, 0.9)
+		pulse(WHITE, 30, 1500, 1.0)
+		pulse(C(255, 190, 110), 30, 1000, 0.75)
+		task.delay(0.1, function() pulse(Theme.Accent, 30, 1250, 0.95) end)
+		task.delay(0.18, function() pulse(WHITE, 30, 700, 0.6) end)
+		for i, r in ipairs(rings) do
+			tween(r.f, { Size = UDim2.fromOffset(r.w * 5, r.h * 5) }, 0.8 + i * 0.08, Enum.EasingStyle.Quad)
+			tween(r.s, { Transparency = 1 }, 0.8 + i * 0.08, Enum.EasingStyle.Quad)
+		end
+		task.delay(0.12, function()
+			tween(scale, { Scale = 1 }, 0.7, Enum.EasingStyle.Back)
+			tween(main, { GroupTransparency = 0 }, 0.5)
+			tween(rootStroke, { Transparency = 0 }, 0.5)
+		end)
+		task.wait(0.09)
+		tween(flash, { BackgroundTransparency = 1 }, 0.6)
+		tween(coreStroke, { Transparency = 1 }, 0.3)
+		task.wait(1.4)
+
+		phase = "done"
+		self.SplashActive = false
+		splash:Destroy()
+
+		self.Ready = true
+		self:_reveal()
+	end)
+
+	self:AddCommand("Ocultar menu", "Acao", function() self:Hide() end)
+	self:AddCommand("Minimizar para orbe", "Acao", function() self:Minimize() end)
+	self:AddCommand("Maximizar / restaurar janela", "Janela", function() self:ToggleMaximize() end)
+	self:AddCommand("Alternar barra lateral", "Janela", function() self:SetCollapsed(not self.Collapsed) end)
+	for _, th in ipairs(Themes) do
+		self:AddCommand("Tema: " .. th[1], "Aparencia", function() self:SetTheme(th[1]) end)
+	end
+	self:AddCommand("Descarregar UI", "Acao", function() self:Destroy() end)
+
+	return self
+end
+
+function Library:_showTip(text)
+	self.TipLabel.Text = text
+	self.Tip.Visible = true
+	self.TipVisible = true
+	tween(self.Tip, { GroupTransparency = 0 }, 0.15)
+end
+function Library:_hideTip()
+	self.TipVisible = false
+	tween(self.Tip, { GroupTransparency = 1 }, 0.12)
+	task.delay(0.14, function()
+		if not self.TipVisible then self.Tip.Visible = false end
+	end)
+end
+function Library:AttachTooltip(obj, text)
+	local token = 0
+	obj.MouseEnter:Connect(function()
+		token += 1
+		local my = token
+		task.delay(0.5, function()
+			if token ~= my then return end
+			local t = type(text) == "function" and text() or text
+			if t and t ~= "" then self:_showTip(t) end
+		end)
+	end)
+	obj.MouseLeave:Connect(function()
+		token += 1
+		self:_hideTip()
+	end)
+end
+
+function Library:AddCommand(name, hint, run)
+	table.insert(self.Commands, { Name = name, Hint = hint or "", Run = run })
+end
+
+function Library:SetAccent(a, b, instant)
+	Theme.Accent, Theme.Accent2 = a, b
+	if instant then
+		accA.Value, accB.Value = a, b
+	else
+		tween(accA, { Value = a }, 0.6, Enum.EasingStyle.Quad)
+		tween(accB, { Value = b }, 0.6, Enum.EasingStyle.Quad)
+	end
+	if self.ActiveTab then self.ActiveTab:_setActive(true) end
+end
+
+function Library:SetTheme(name)
+	for _, th in ipairs(Themes) do
+		if th[1] == name then
+			self:SetAccent(th[2], th[3])
+			local dd, pk = self.Flags["Tema"], self.Flags["CorDestaque"]
+			if dd then dd:Set(name, true) end
+			if pk then pk:Set(th[2], true) end
+			return th
+		end
+	end
+	return nil
+end
+
+function Library:_paletteStyle()
+	local p = self.Pal
+	for i, row in ipairs(p.Rows) do
+		local selected = (i == self.PalSel) and p.List[i] ~= nil
+		tween(row.Frame, { BackgroundTransparency = selected and 0 or 1 }, 0.12)
+		row.Label.TextColor3 = selected and Theme.Text or Theme.SubText
+	end
+end
+
+function Library:_paletteRefresh()
+	local p = self.Pal
+	local q = p.Input.Text:lower()
+	local list = {}
+	for _, c in ipairs(self.Commands) do
+		if q == "" or c.Name:lower():find(q, 1, true) then
+			table.insert(list, c)
+			if #list >= 7 then break end
+		end
+	end
+	p.List = list
+	if self.PalSel > #list then self.PalSel = math.max(#list, 1) end
+	for i, row in ipairs(p.Rows) do
+		local c = list[i]
+		if c then
+			row.Frame.Visible = true
+			row.Label.Text, row.Hint.Text = c.Name, c.Hint
+		elseif i == 1 then
+			row.Frame.Visible = true
+			row.Label.Text, row.Hint.Text = "Nenhum resultado", ""
+		else
+			row.Frame.Visible = false
+		end
+	end
+	self:_paletteStyle()
+	tween(p.Box, { Size = UDim2.fromOffset(400, 47 + 10 + math.max(#list, 1) * 34) }, 0.2)
+end
+
+function Library:_paletteRun(index)
+	local c = self.Pal.List[index]
+	if not c then return end
+	self:ClosePalette()
+	task.delay(0.12, function() c.Run() end)
+end
+
+function Library:OpenPalette()
+	local p = self.Pal
+	if p.Open or not self.Open then return end
+	p.Open = true
+	self.PalSel = 1
+	p.Group.Visible = true
+	p.Group.GroupTransparency = 1
+	p.Box.Position = UDim2.new(0.5, 0, 0, 36)
+	tween(p.Group, { GroupTransparency = 0 }, 0.2)
+	tween(p.Box, { Position = UDim2.new(0.5, 0, 0, 64) }, 0.45, Enum.EasingStyle.Back)
+	p.Input.Text = ""
+	self:_paletteRefresh()
+	task.defer(function()
+		p.Input.Text = ""
+		p.Input:CaptureFocus()
+	end)
+end
+
+function Library:ClosePalette()
+	local p = self.Pal
+	if not p.Open then return end
+	p.Open = false
+	p.Input:ReleaseFocus()
+	tween(p.Group, { GroupTransparency = 1 }, 0.18)
+	tween(p.Box, { Position = UDim2.new(0.5, 0, 0, 44) }, 0.2)
+	task.delay(0.2, function()
+		if not p.Open then p.Group.Visible = false end
+	end)
+end
+
+function Library:_reveal()
+	for i, tab in ipairs(self.Tabs) do
+		task.delay((i - 1) * 0.06, function()
+			tween(tab.Row, { GroupTransparency = 0, Position = UDim2.fromOffset(8, tab.Y) }, 0.5)
+		end)
+	end
+	tween(self.Footer, { GroupTransparency = 0 }, 0.5)
+	tween(self.Pill, { GroupTransparency = 0 }, 0.5)
+end
+
+function Library:SetCollapsed(state)
+	if self.Collapsed == state then return end
+	self.Collapsed = state
+	local w = state and SIDEBAR_COMPACT or SIDEBAR_FULL
+	self.SidebarW = w
+	tween(self.Sidebar, { Size = UDim2.new(0, w, 1, -TOPBAR_H) }, 0.45)
+	local pagePos, pageSize = UDim2.fromOffset(w, TOPBAR_H), UDim2.new(1, -w, 1, -TOPBAR_H)
+	tween(self.Pages, { Position = pagePos, Size = pageSize }, 0.45)
+	tween(self.ParticleFrame, { Position = pagePos, Size = pageSize }, 0.45)
+	tween(self.Pill, { Size = UDim2.fromOffset(w - 16, TAB_H) }, 0.45)
+	tween(self.Footer, { Size = UDim2.fromOffset(w - 16, 50) }, 0.45)
+	tween(self.NavLabel, { TextTransparency = state and 1 or 0 }, 0.25)
+	tween(self.Bars[2], { Size = UDim2.fromOffset(state and 7 or 12, 2) }, 0.3, Enum.EasingStyle.Back)
+	for _, tab in ipairs(self.Tabs) do
+		tween(tab.Row, { Size = UDim2.fromOffset(w - 16, TAB_H) }, 0.45)
+		tween(tab.Label, { TextTransparency = state and 1 or 0 }, 0.25)
+	end
+end
+
+function Library:ToggleMaximize()
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+	if not self.Maximized then
+		self._restore = { Size = self.Root.Size, Position = self.Root.Position }
+		self.Maximized = true
+		local w, h = vp.X - 80, vp.Y - 80
+		tween(self.Root, { Size = UDim2.fromOffset(w, h), Position = UDim2.new(0.5, -w / 2, 0.5, -h / 2) }, 0.55)
+	else
+		self.Maximized = false
+		tween(self.Root, { Size = self._restore.Size, Position = self._restore.Position }, 0.55)
+	end
+end
+
+function Library:_setBreadcrumb(text, instant)
+	local l = self.Breadcrumb
+	if instant then l.Text = text; return end
+	tween(l, { TextTransparency = 1 }, 0.1)
+	task.delay(0.1, function()
+		l.Text = text
+		tween(l, { TextTransparency = 0 }, 0.25)
+	end)
+end
+
+function Library:Toggle(state)
+	if self.SplashActive then return end
+	if state == nil then state = not self.Open end
+	if state == self.Open then return end
+	self.Open = state
+	if state then
+		if self.Minimized then
+			self.Minimized = false
+			tween(self.Orb, { Size = UDim2.fromOffset(0, 0) }, 0.25, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+			task.delay(0.26, function() if not self.Minimized then self.Orb.Visible = false end end)
+		end
+		self.Root.Visible = true
+		tween(self.Scale, { Scale = 1 }, 0.5, Enum.EasingStyle.Back)
+		tween(self.Main, { GroupTransparency = self.BaseT }, 0.25)
+		tween(self.RootStroke, { Transparency = 0 }, 0.25)
+	else
+		if self.Pal.Open then self:ClosePalette() end
+		self:_hideTip()
+		tween(self.Scale, { Scale = 0.92 }, 0.25)
+		tween(self.Main, { GroupTransparency = 1 }, 0.2)
+		tween(self.RootStroke, { Transparency = 1 }, 0.2)
+		task.delay(0.27, function() if not self.Open then self.Root.Visible = false end end)
+	end
+end
+
+function Library:Hide()
+	if not self.Open then return end
+	self:Toggle(false)
+	if not self._hintShown then
+		self._hintShown = true
+		self:Notify("Menu oculto", "Pressione " .. self.ToggleKey.Name .. " para abrir novamente.", 4, "info")
+	end
+end
+
+function Library:Minimize()
+	if not self.Open then return end
+	self:Toggle(false)
+	self.Minimized = true
+	self.Orb.Visible = true
+	self.Orb.Size = UDim2.fromOffset(0, 0)
+	task.delay(0.15, function()
+		if self.Minimized then tween(self.Orb, { Size = UDim2.fromOffset(48, 48) }, 0.5, Enum.EasingStyle.Back) end
+	end)
+end
+
+function Library:Destroy()
+	tween(self.Scale, { Scale = 0.88 }, 0.25)
+	tween(self.Main, { GroupTransparency = 1 }, 0.22)
+	tween(self.RootStroke, { Transparency = 1 }, 0.22)
+	task.delay(0.28, function()
+		for _, c in ipairs(self.Connections) do c:Disconnect() end
+		self.Gui:Destroy()
+	end)
+end
+
+function Library:Notify(title, text, duration, kind)
+	duration = duration or 4
+	self._toastCount += 1
+	local color = ({ success = Theme.Success, warn = Theme.Warn, error = Theme.Danger })[kind or ""] or Theme.Accent
+
+	local holder = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 68), BackgroundTransparency = 1,
+		LayoutOrder = self._toastCount, Parent = self.ToastHolder,
+	})
+	local toast = new("Frame", {
+		Size = UDim2.fromScale(1, 1), Position = UDim2.new(1, 40, 0, 0), BackgroundColor3 = Theme.Card,
+		BorderSizePixel = 0, ClipsDescendants = true, Parent = holder,
+	}, { corner(11), stroke(Theme.Stroke) })
+
+	new("Frame", {
+		Size = UDim2.new(0, 3, 1, -22), Position = UDim2.fromOffset(11, 11),
+		BackgroundColor3 = color, BorderSizePixel = 0, Parent = toast,
+	}, { corner(2) })
+	new("TextLabel", {
+		Text = title or "", Font = Theme.FontBold, TextSize = 13, TextColor3 = Theme.Text,
+		TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(26, 10), Size = UDim2.new(1, -38, 0, 16), Parent = toast,
+	})
+	new("TextLabel", {
+		Text = text or "", Font = Theme.Font, TextSize = 12, TextColor3 = Theme.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(26, 28), Size = UDim2.new(1, -38, 0, 32), Parent = toast,
+	})
+	local bar = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
+		BackgroundColor3 = color, BorderSizePixel = 0, Parent = toast,
+	})
+	local click = new("TextButton", {
+		Text = "", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 10, Parent = toast,
+	})
+
+	tween(toast, { Position = UDim2.fromOffset(0, 0) }, 0.55, Enum.EasingStyle.Back)
+	tween(bar, { Size = UDim2.new(0, 0, 0, 2) }, duration * Theme.Speed, Enum.EasingStyle.Linear)
+
+	local dismissed = false
+	local function dismiss()
+		if dismissed or not toast.Parent then return end
+		dismissed = true
+		tween(toast, { Position = UDim2.new(1, 40, 0, 0) }, 0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+		task.wait(0.36)
+		tween(holder, { Size = UDim2.new(1, 0, 0, 0) }, 0.2)
+		task.wait(0.22)
+		holder:Destroy()
+	end
+	click.MouseButton1Click:Connect(function() task.spawn(dismiss) end)
+	task.delay(duration, dismiss)
+end
+
+function Library:SelectTab(tab, instant)
+	if self.ActiveTab == tab then return end
+	local old = self.ActiveTab
+	self.ActiveTab = tab
+
+	if old then
+		old:_setActive(false)
+		tween(old.Page, { GroupTransparency = 1, Position = UDim2.fromOffset(0, -10) }, 0.15, Enum.EasingStyle.Quad)
+		task.delay(0.16, function()
+			if self.ActiveTab ~= old then old.Page.Visible = false end
+		end)
+	end
+
+	tab:_setActive(true)
+	self:_setBreadcrumb(tab.Name, instant)
+
+	local target = UDim2.fromOffset(8, tab.Y)
+	if instant then
+		self.Pill.Position = target
+	else
+		tween(self.Pill, { Position = target }, 0.5, Enum.EasingStyle.Back)
+	end
+
+	tab.Underline.Size = UDim2.fromOffset(0, 3)
+	tab.Page.Position = UDim2.fromOffset(0, 18)
+	tab.Page.GroupTransparency = 1
+	tab.Page.Visible = true
+	task.delay(old and 0.1 or 0, function()
+		if self.ActiveTab ~= tab then return end
+		tween(tab.Page, { GroupTransparency = 0, Position = UDim2.fromOffset(0, 0) }, 0.5)
+		task.delay(0.12, function()
+			tween(tab.Underline, { Size = UDim2.fromOffset(36, 3) }, 0.55, Enum.EasingStyle.Back)
+		end)
+	end)
+	tab:_stagger()
+end
+
+function Library:ListConfigs()
+	local out = {}
+	if useFiles then
+		local ok, files = pcall(fsList, CONFIG_DIR)
+		if ok and type(files) == "table" then
+			for _, path in ipairs(files) do
+				local n = tostring(path):match("([^/\\]+)%.json$")
+				if n then table.insert(out, n) end
+			end
+		end
+	else
+		for n in pairs(MemConfigs) do table.insert(out, n) end
+	end
+	table.sort(out)
+	return out
+end
+
+function Library:ExportConfig()
+	local data = {}
+	for key, obj in pairs(self.Flags) do
+		if not obj.NoConfig and obj.Serialize then
+			local ok, v = pcall(obj.Serialize, obj)
+			if ok then data[key] = v end
+		end
+	end
+	return data
+end
+
+function Library:ImportConfig(data)
+	for key, val in pairs(data) do
+		local obj = self.Flags[key]
+		if obj and obj.Deserialize then pcall(obj.Deserialize, obj, val) end
+	end
+end
+
+function Library:SaveConfig(name)
+	name = cleanName(name)
+	if name == "" then return false, "Nome invalido" end
+	local ok, json = pcall(HttpService.JSONEncode, HttpService, self:ExportConfig())
+	if not ok then return false, "Falha ao serializar" end
+	if useFiles then
+		pcall(function() if not fsIsFolder(CONFIG_DIR) then fsMake(CONFIG_DIR) end end)
+		local wrote = pcall(fsWrite, configPath(name), json)
+		if not wrote then return false, "Falha ao gravar arquivo" end
+	else
+		MemConfigs[name] = json
+	end
+	return true, name
+end
+
+function Library:LoadConfig(name)
+	name = cleanName(name)
+	local json
+	if useFiles then
+		local ok, content = pcall(function()
+			if fsIsFile(configPath(name)) then return fsRead(configPath(name)) end
+		end)
+		if ok then json = content end
+	else
+		json = MemConfigs[name]
+	end
+	if not json then return false, "Perfil nao encontrado" end
+	local ok, data = pcall(HttpService.JSONDecode, HttpService, json)
+	if not ok or type(data) ~= "table" then return false, "Arquivo corrompido" end
+	self.Loading = true
+	self:ImportConfig(data)
+	task.delay(0.3, function() self.Loading = false end)
+	return true, name
+end
+
+function Library:DeleteConfig(name)
+	name = cleanName(name)
+	if useFiles then
+		if not fsDel then return false, "delfile indisponivel" end
+		local ok = pcall(function()
+			if fsIsFile(configPath(name)) then fsDel(configPath(name)) end
+		end)
+		return ok, name
+	end
+	MemConfigs[name] = nil
+	return true, name
+end
+
+Library.UsesFiles = useFiles
+
+local function attachComponents(tab, window)
+	tab._order = 0
+	tab.Cards = {}
+
+	local function nextOrder()
+		tab._order += 1
+		return tab._order
+	end
+	local function clearPlaceholder()
+		if tab.Placeholder and tab.Placeholder.Parent then
+			tab.Placeholder:Destroy()
+			tab.Placeholder = nil
+		end
+	end
+	local function trackCard(group)
+		table.insert(tab.Cards, group)
+		if window.ActiveTab == tab then
+			local n = #tab.Cards
+			task.delay(0.15 + math.min(n, 12) * 0.045, function()
+				if group.Parent then tween(group, { GroupTransparency = 0 }, 0.4) end
+			end)
+		end
+	end
+	function tab:_stagger()
+		for i, g in ipairs(tab.Cards) do
+			if g.Parent then
+				g.GroupTransparency = 1
+				task.delay(0.12 + math.min(i, 12) * 0.045, function()
+					if window.ActiveTab == tab and g.Parent then tween(g, { GroupTransparency = 0 }, 0.4) end
+				end)
+			end
+		end
+	end
+
+	local function makeCard(height, opt)
+		clearPlaceholder()
+		local card = new("CanvasGroup", {
+			Size = UDim2.new(1, 0, 0, height), BackgroundColor3 = Theme.Card, BorderSizePixel = 0,
+			GroupTransparency = 1, LayoutOrder = nextOrder(), Parent = tab.Content,
+		}, { corner(10) })
+		local ov = new("Frame", {
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(1, 1), Size = UDim2.new(1, -2, 1, -2),
+			ZIndex = 10, Parent = card,
+		}, { corner(9) })
+		local st = stroke(Theme.Stroke)
+		st.Parent = ov
+		trackCard(card)
+		if opt and opt.Tooltip then window:AttachTooltip(card, opt.Tooltip) end
+		return card, st
+	end
+	local function hoverable(card, st, hit)
+		hit.MouseEnter:Connect(function()
+			tween(card, { BackgroundColor3 = Theme.CardHover }, 0.15)
+			tween(st, { Color = Theme.StrokeHi }, 0.15)
+		end)
+		hit.MouseLeave:Connect(function()
+			tween(card, { BackgroundColor3 = Theme.Card }, 0.25)
+			tween(st, { Color = Theme.Stroke }, 0.25)
+		end)
+	end
+	local function hitbox(parent, size, pos)
+		return new("TextButton", {
+			Text = "", AutoButtonColor = false, BackgroundTransparency = 1,
+			Size = size or UDim2.fromScale(1, 1), Position = pos or UDim2.new(), ZIndex = 3, Parent = parent,
+		})
+	end
+	local function nameLabel(parent, text, y, h, width)
+		return new("TextLabel", {
+			Text = text or "", Font = Theme.Font, TextSize = 13, TextColor3 = Theme.Text,
+			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(16, y),
+			Size = UDim2.new(1, width or -90, 0, h), Parent = parent,
+		})
+	end
+	local function register(opt, obj)
+		obj.NoConfig = opt.NoConfig
+		window.Flags[opt.Flag or opt.Name or tostring(obj)] = obj
+	end
+
+	function tab:AddSection(text)
+		clearPlaceholder()
+		local f = new("CanvasGroup", {
+			Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1, GroupTransparency = 1,
+			LayoutOrder = nextOrder(), Parent = tab.Content,
+		})
+		local up = string.upper(text)
+		local w = TextService:GetTextSize(up, 11, Theme.FontBold, Vector2.new(1000, 20)).X
+		local secBar = new("Frame", {
+			Size = UDim2.fromOffset(3, 12), Position = UDim2.fromOffset(2, 11),
+			BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = f,
+		}, { corner(2) })
+		bindColor(secBar, "BackgroundColor3")
+		new("TextLabel", {
+			Text = up, Font = Theme.FontBold, TextSize = 11, TextColor3 = Theme.SubText,
+			TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 4), Size = UDim2.fromOffset(w + 4, 26), Parent = f,
+		})
+		new("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, w + 26, 0.5, 4),
+			Size = UDim2.new(1, -(w + 26), 0, 1), BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0, Parent = f,
+		})
+		trackCard(f)
+		return f
+	end
+
+	function tab:AddLabel(text)
+		clearPlaceholder()
+		local f = new("CanvasGroup", {
+			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+			GroupTransparency = 1, LayoutOrder = nextOrder(), Parent = tab.Content,
+		})
+		local lab = new("TextLabel", {
+			Text = text, Font = Theme.Font, TextSize = 12, TextColor3 = Theme.SubText,
+			TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+			TextWrapped = true, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y, Parent = f,
+		})
+		trackCard(f)
+		return lab
+	end
+
+	function tab:AddButton(opt)
+		local card, st = makeCard(40, opt)
+		local hit = hitbox(card)
+		new("TextLabel", {
+			Text = opt.Name, Font = Theme.FontBold, TextSize = 13, TextColor3 = Theme.Text,
+			BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = card,
+		})
+		local underline = new("Frame", {
+			Size = UDim2.new(0, 0, 0, 2), AnchorPoint = Vector2.new(0.5, 1),
+			Position = UDim2.new(0.5, 0, 1, 0), BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = card,
+		})
+		bindGradient(new("UIGradient", { Parent = underline }))
+		hoverable(card, st, hit)
+		hit.MouseEnter:Connect(function() tween(underline, { Size = UDim2.new(1, 0, 0, 2) }, 0.35) end)
+		hit.MouseLeave:Connect(function() tween(underline, { Size = UDim2.new(0, 0, 0, 2) }, 0.3) end)
+		hit.InputBegan:Connect(function(input)
+			if isPress(input) then ripple(card, input.Position.X) end
+		end)
+		hit.MouseButton1Click:Connect(function()
+			if opt.Callback then task.spawn(opt.Callback) end
+		end)
+	end
+
+	function tab:AddToggle(opt)
+		local hasDesc = opt.Description ~= nil
+		local card, st = makeCard(hasDesc and 56 or 44, opt)
+		local hit = hitbox(card)
+		if hasDesc then
+			nameLabel(card, opt.Name, 9, 16)
+			new("TextLabel", {
+				Text = opt.Description, Font = Theme.Font, TextSize = 11, TextColor3 = Theme.SubText,
+				TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(16, 28), Size = UDim2.new(1, -90, 0, 14), Parent = card,
+			})
+		else
+			nameLabel(card, opt.Name, 0, 44)
+		end
+		local track = new("Frame", {
+			Size = UDim2.fromOffset(40, 22), AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -16, 0.5, 0), BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0, Parent = card,
+		}, { round() })
+		local knob = new("Frame", {
+			Size = UDim2.fromOffset(16, 16), Position = UDim2.fromOffset(3, 3),
+			BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = track,
+		}, { round() })
+
+		local stripe = new("Frame", {
+			Size = UDim2.fromOffset(3, 0), AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.fromScale(0, 0.5), BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = card,
+		}, { corner(2) })
+		bindColor(stripe, "BackgroundColor3")
+
+		local obj = { Type = "toggle", Value = opt.Default and true or false }
+		bind(function(a)
+			if obj.Value then track.BackgroundColor3 = a end
+		end)
+		local function render(animate)
+			local t = animate and 0.3 or 0
+			tween(stripe, { Size = UDim2.fromOffset(3, obj.Value and 24 or 0) }, t, Enum.EasingStyle.Back)
+			tween(knob, { Position = obj.Value and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3) }, t, Enum.EasingStyle.Back)
+			tween(track, { BackgroundColor3 = obj.Value and Theme.Accent or Theme.Stroke }, t)
+		end
+		function obj:Set(v, silent)
+			self.Value = v and true or false
+			render(true)
+			if not silent and opt.Callback then task.spawn(opt.Callback, self.Value) end
+		end
+		function obj:Get() return self.Value end
+		function obj:Serialize() return self.Value end
+		function obj:Deserialize(v) self:Set(v) end
+
+		hoverable(card, st, hit)
+		hit.InputBegan:Connect(function(input)
+			if isPress(input) then ripple(card, input.Position.X) end
+		end)
+		hit.MouseButton1Click:Connect(function() obj:Set(not obj.Value) end)
+		render(false)
+		register(opt, obj)
+		return obj
+	end
+
+	function tab:AddSlider(opt)
+		local min, max = opt.Min or 0, opt.Max or 100
+		local inc = opt.Increment or 1
+		local card, st = makeCard(60, opt)
+		nameLabel(card, opt.Name, 9, 16, -130)
+		local valueLabel = new("TextLabel", {
+			Text = "", Font = Theme.FontBold, TextSize = 11, TextColor3 = Theme.Text,
+			TextXAlignment = Enum.TextXAlignment.Center, BackgroundColor3 = Theme.Input,
+			AutomaticSize = Enum.AutomaticSize.X,
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 7), Size = UDim2.fromOffset(0, 20), Parent = card,
+		}, { corner(6), padding(8, 8, 0, 0) })
+		local track = new("Frame", {
+			Position = UDim2.fromOffset(16, 38), Size = UDim2.new(1, -32, 0, 6),
+			BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0, Parent = card,
+		}, { round() })
+		local fill = new("Frame", {
+			Size = UDim2.fromScale(0, 1), BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = track,
+		}, { round() })
+		local fillGrad = new("UIGradient", { Parent = fill })
+		bindGradient(fillGrad)
+		local knob = new("Frame", {
+			Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0, 0.5), BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 2, Parent = track,
+		}, { round() })
+		local knobStroke = new("UIStroke", { Thickness = 2, Parent = knob })
+		bindColor(knobStroke, "Color")
+
+		local obj = { Type = "slider", Value = opt.Default or min }
+		local function fmt(v)
+			local s = (inc < 1) and string.format("%.1f", v) or string.format("%d", v)
+			return s .. (opt.Suffix or "")
+		end
+		local function render(animate)
+			local r = (obj.Value - min) / (max - min)
+			local t = animate and 0.08 or 0
+			tween(fill, { Size = UDim2.fromScale(r, 1) }, t, Enum.EasingStyle.Quad)
+			tween(knob, { Position = UDim2.fromScale(r, 0.5) }, t, Enum.EasingStyle.Quad)
+			valueLabel.Text = fmt(obj.Value)
+		end
+		function obj:Set(v, silent)
+			v = math.clamp(math.floor(v / inc + 0.5) * inc, min, max)
+			if v == self.Value then return end
+			self.Value = v
+			render(true)
+			if not silent and opt.Callback then task.spawn(opt.Callback, v) end
+		end
+		function obj:Get() return self.Value end
+		function obj:Serialize() return self.Value end
+		function obj:Deserialize(v) self:Set(tonumber(v) or self.Value) end
+
+		local hit = hitbox(card, UDim2.new(1, -16, 0, 26), UDim2.fromOffset(8, 30))
+		hit.MouseEnter:Connect(function()
+			tween(card, { BackgroundColor3 = Theme.CardHover }, 0.15)
+			tween(st, { Color = Theme.StrokeHi }, 0.15)
+		end)
+		hit.MouseLeave:Connect(function()
+			tween(card, { BackgroundColor3 = Theme.Card }, 0.25)
+			tween(st, { Color = Theme.Stroke }, 0.25)
+		end)
+		local dragging = false
+		hit.InputBegan:Connect(function(input)
+			if isPress(input) then
+				dragging = true
+				tween(knob, { Size = UDim2.fromOffset(18, 18) }, 0.15, Enum.EasingStyle.Back)
+			end
+		end)
+		dragArea(hit, function(p)
+			local r = math.clamp((p.X - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+			obj:Set(min + (max - min) * r)
+		end)
+		table.insert(window.Connections, UserInputService.InputEnded:Connect(function(input)
+			if dragging and isPress(input) then
+				dragging = false
+				tween(knob, { Size = UDim2.fromOffset(14, 14) }, 0.2, Enum.EasingStyle.Back)
+			end
+		end))
+		render(false)
+		register(opt, obj)
+		return obj
+	end
+
+	function tab:AddDropdown(opt)
+		local options = opt.Options or {}
+		local multi = opt.Multi and true or false
+		local card, st = makeCard(44, opt)
+		nameLabel(card, opt.Name, 0, 44, -190)
+		local current = new("TextLabel", {
+			Text = "", Font = Theme.FontBold, TextSize = 12, TextColor3 = Theme.Accent,
+			TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -38, 0, 0), Size = UDim2.fromOffset(170, 44), Parent = card,
+		})
+		bindColor(current, "TextColor3")
+		local arrow = new("TextLabel", {
+			Text = "", Font = Theme.FontBold, TextSize = 9, TextColor3 = Theme.SubText,
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(1, -22, 0, 22), Size = UDim2.fromOffset(14, 14), Parent = card,
+		})
+		local hit = hitbox(card, UDim2.new(1, 0, 0, 44))
+		local list = new("Frame", {
+			Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 0, #options * 30), BackgroundTransparency = 1, Parent = card,
+		}, { new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }) })
+
+		local obj = { Type = "dropdown", Expanded = false, Multi = multi, Options = options }
+		if multi then
+			obj.Value = {}
+			for _, v in ipairs(opt.Default or {}) do obj.Value[v] = true end
+		else
+			obj.Value = opt.Default or options[1]
+		end
+		local buttons = {}
+		local function isSelected(name)
+			if multi then return obj.Value[name] == true end
+			return obj.Value == name
+		end
+		local function summary()
+			if multi then
+				local names = {}
+				for _, n in ipairs(options) do if obj.Value[n] then table.insert(names, n) end end
+				if #names == 0 then return "Nenhum" end
+				return table.concat(names, ", ")
+			end
+			return obj.Value == nil and "Nenhum" or tostring(obj.Value)
+		end
+		local function paint()
+			current.Text = summary()
+			for name, b in pairs(buttons) do
+				tween(b, { TextColor3 = isSelected(name) and Theme.Text or Theme.SubText }, 0.2)
+			end
+		end
+		local function height(expanded)
+			return expanded and (44 + #options * 30 + 4) or 44
+		end
+		local function emit()
+			if not opt.Callback then return end
+			if multi then
+				local copy = {}
+				for k, v in pairs(obj.Value) do copy[k] = v end
+				task.spawn(opt.Callback, copy)
+			else
+				task.spawn(opt.Callback, obj.Value)
+			end
+		end
+		local function build()
+			for _, b in pairs(buttons) do b:Destroy() end
+			table.clear(buttons)
+			list.Size = UDim2.new(1, 0, 0, #options * 30)
+			for i, name in ipairs(options) do
+				local b = new("TextButton", {
+					Text = name, Font = Theme.Font, TextSize = 12, TextColor3 = Theme.SubText,
+					TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false,
+					BackgroundColor3 = Theme.CardHover, BackgroundTransparency = 1,
+					Size = UDim2.new(1, 0, 0, 30), LayoutOrder = i, Parent = list,
+				}, { padding(16, 0, 0, 0) })
+				buttons[name] = b
+				b.MouseEnter:Connect(function() tween(b, { BackgroundTransparency = 0 }, 0.12) end)
+				b.MouseLeave:Connect(function() tween(b, { BackgroundTransparency = 1 }, 0.2) end)
+				b.MouseButton1Click:Connect(function()
+					if multi then
+						obj.Value[name] = (not obj.Value[name]) or nil
+						paint()
+						emit()
+					else
+						obj:Set(name)
+						obj:Toggle(false)
+					end
+				end)
+			end
+			paint()
+			if obj.Expanded then tween(card, { Size = UDim2.new(1, 0, 0, height(true)) }, 0.3) end
+		end
+		function obj:Toggle(state)
+			self.Expanded = state
+			tween(card, { Size = UDim2.new(1, 0, 0, height(state)) }, 0.35)
+			tween(arrow, { Rotation = state and 180 or 0 }, 0.3)
+		end
+		function obj:Set(v, silent)
+			if multi then
+				self.Value = {}
+				for _, n in ipairs(type(v) == "table" and v or {}) do self.Value[n] = true end
+			else
+				self.Value = v
+			end
+			paint()
+			if not silent then emit() end
+		end
+		function obj:Get() return self.Value end
+		function obj:Refresh(newOptions)
+			options = newOptions
+			self.Options = newOptions
+			if not multi then
+				local found = false
+				for _, n in ipairs(newOptions) do if n == self.Value then found = true end end
+				if not found then self.Value = newOptions[1] end
+			end
+			build()
+		end
+		function obj:Serialize()
+			if multi then
+				local out = {}
+				for _, n in ipairs(options) do if self.Value[n] then table.insert(out, n) end end
+				return out
+			end
+			return self.Value
+		end
+		function obj:Deserialize(v) self:Set(v) end
+
+		hoverable(card, st, hit)
+		hit.InputBegan:Connect(function(input)
+			if isPress(input) then ripple(hit, input.Position.X) end
+		end)
+		hit.MouseButton1Click:Connect(function() obj:Toggle(not obj.Expanded) end)
+		build()
+		register(opt, obj)
+		return obj
+	end
+
+	function tab:AddKeybind(opt)
+		local card, st = makeCard(44, opt)
+		local hit = hitbox(card)
+		nameLabel(card, opt.Name, 0, 44, -130)
+		local chip = new("TextLabel", {
+			Text = "", Font = Theme.FontBold, TextSize = 11, TextColor3 = Theme.Text,
+			BackgroundColor3 = Theme.Stroke, AutomaticSize = Enum.AutomaticSize.X,
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -16, 0.5, 0),
+			Size = UDim2.fromOffset(0, 24), Parent = card,
+		}, { corner(7), padding(10, 10, 0, 0) })
+
+		local obj = { Type = "keybind", Value = opt.Default or Enum.KeyCode.Unknown, Callback = opt.Callback }
+		local function paint() chip.Text = obj.Value == Enum.KeyCode.Unknown and "" or obj.Value.Name end
+		function obj:Set(key, silent)
+			self.Value = key
+			paint()
+			if not silent and opt.Changed then task.spawn(opt.Changed, key) end
+		end
+		function obj:Get() return self.Value end
+		function obj:Serialize() return self.Value.Name end
+		function obj:Deserialize(name)
+			local ok, key = pcall(function() return Enum.KeyCode[name] end)
+			if ok and key then self:Set(key) end
+		end
+
+		hoverable(card, st, hit)
+		hit.InputBegan:Connect(function(input)
+			if isPress(input) then ripple(card, input.Position.X) end
+		end)
+		hit.MouseButton1Click:Connect(function()
+			if window.Listening then return end
+			window.Listening = true
+			window._listenAt = os.clock()
+			chip.Text = "..."
+			tween(chip, { BackgroundColor3 = Theme.Accent }, 0.2)
+			local conn
+			conn = UserInputService.InputBegan:Connect(function(input)
+				if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+				conn:Disconnect()
+				if input.KeyCode == Enum.KeyCode.Escape then
+					paint()
+				else
+					obj:Set(input.KeyCode)
+				end
+				tween(chip, { BackgroundColor3 = Theme.Stroke }, 0.2)
+				task.delay(0.1, function() window.Listening = false end)
+			end)
+		end)
+		paint()
+		if opt.Callback then table.insert(window.Keybinds, obj) end
+		register(opt, obj)
+		return obj
+	end
+
+	function tab:AddInput(opt)
+		local card, st = makeCard(44, opt)
+		nameLabel(card, opt.Name, 0, 44, -200)
+		local boxBg = new("Frame", {
+			Size = UDim2.fromOffset(176, 28), AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -14, 0.5, 0), BackgroundColor3 = Theme.Input, Parent = card,
+		}, { corner(7) })
+		local boxStroke = stroke(Theme.Stroke)
+		boxStroke.Parent = boxBg
+		local tb = new("TextBox", {
+			Text = opt.Default or "", PlaceholderText = opt.Placeholder or "",
+			PlaceholderColor3 = Theme.SubText, TextColor3 = Theme.Text, Font = Theme.Font, TextSize = 12,
+			TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, BackgroundTransparency = 1,
+			TextTruncate = Enum.TextTruncate.AtEnd, Size = UDim2.fromScale(1, 1), Parent = boxBg,
+		}, { padding(10, 10, 0, 0) })
+
+		local obj = { Type = "input", Value = opt.Default or "" }
+		function obj:Set(v, silent)
+			self.Value = tostring(v or "")
+			tb.Text = self.Value
+			if not silent and opt.Callback then task.spawn(opt.Callback, self.Value, false) end
+		end
+		function obj:Get() return self.Value end
+		function obj:Serialize() return self.Value end
+		function obj:Deserialize(v) self:Set(v) end
+
+		tb.Focused:Connect(function() tween(boxStroke, { Color = Theme.Accent }, 0.2) end)
+		tb.FocusLost:Connect(function(enter)
+			tween(boxStroke, { Color = Theme.Stroke }, 0.25)
+			obj.Value = tb.Text
+			if opt.Callback then task.spawn(opt.Callback, obj.Value, enter) end
+		end)
+		tb:GetPropertyChangedSignal("Text"):Connect(function()
+			obj.Value = tb.Text
+			if opt.Live and opt.Callback then task.spawn(opt.Callback, obj.Value, false) end
+		end)
+		boxBg.MouseEnter:Connect(function()
+			if not tb:IsFocused() then tween(boxStroke, { Color = Theme.StrokeHi }, 0.15) end
+		end)
+		boxBg.MouseLeave:Connect(function()
+			if not tb:IsFocused() then tween(boxStroke, { Color = Theme.Stroke }, 0.2) end
+		end)
+		register(opt, obj)
+		return obj
+	end
+
+	function tab:AddColorPicker(opt)
+		local PICK_H = 104
+		local card, st = makeCard(44, opt)
+		nameLabel(card, opt.Name, 0, 44, -170)
+		local hit = hitbox(card, UDim2.new(1, 0, 0, 44))
+		local swatch = new("Frame", {
+			Size = UDim2.fromOffset(30, 20), AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -38, 0, 22), BackgroundColor3 = WHITE, Parent = card,
+		}, { corner(6), stroke(Theme.StrokeHi) })
+		local hex = new("TextLabel", {
+			Text = "", Font = Theme.FontBold, TextSize = 11, TextColor3 = Theme.SubText,
+			TextXAlignment = Enum.TextXAlignment.Right, BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -76, 0, 22), Size = UDim2.fromOffset(64, 16), Parent = card,
+		})
+		local arrow = new("TextLabel", {
+			Text = "", Font = Theme.FontBold, TextSize = 9, TextColor3 = Theme.SubText,
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(1, -22, 0, 22), Size = UDim2.fromOffset(14, 14), Parent = card,
+		})
+
+		local sv = new("Frame", {
+			Position = UDim2.fromOffset(16, 52), Size = UDim2.new(1, -64, 0, PICK_H),
+			BackgroundColor3 = Color3.fromHSV(0, 1, 1), BorderSizePixel = 0, Parent = card,
+		}, { corner(6) })
+		local white = new("Frame", {
+			Size = UDim2.fromScale(1, 1), BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = sv,
+		}, {
+			corner(6),
+			new("UIGradient", { Transparency = NumberSequence.new(0, 1) }),
+		})
+		local black = new("Frame", {
+			Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Parent = sv,
+		}, {
+			corner(6),
+			new("UIGradient", { Rotation = 90, Transparency = NumberSequence.new(1, 0) }),
+		})
+		local svCursor = new("Frame", {
+			Size = UDim2.fromOffset(12, 12), AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundTransparency = 1, ZIndex = 4, Parent = sv,
+		}, { round(), stroke(WHITE, 2) })
+
+		local hue = new("Frame", {
+			Position = UDim2.new(1, -34, 0, 52), Size = UDim2.fromOffset(18, PICK_H),
+			BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = card,
+		}, { corner(6) })
+		local keys = {}
+		for i = 0, 6 do table.insert(keys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(i / 6, 1, 1))) end
+		new("UIGradient", { Rotation = 90, Color = ColorSequence.new(keys), Parent = hue })
+		local hueCursor = new("Frame", {
+			Size = UDim2.fromOffset(24, 4), AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 4, Parent = hue,
+		}, { corner(2), stroke(Color3.new(0, 0, 0), 1, 0.4) })
+
+		local def = opt.Default or Color3.fromRGB(255, 255, 255)
+		local h, s, v = def:ToHSV()
+		local obj = { Type = "color", Expanded = false, Value = def }
+
+		local function paint()
+			obj.Value = Color3.fromHSV(h, s, v)
+			swatch.BackgroundColor3 = obj.Value
+			sv.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+			svCursor.Position = UDim2.fromScale(s, 1 - v)
+			hueCursor.Position = UDim2.fromScale(0.5, h)
+			hex.Text = string.format("#%02X%02X%02X",
+				math.floor(obj.Value.R * 255 + 0.5), math.floor(obj.Value.G * 255 + 0.5), math.floor(obj.Value.B * 255 + 0.5))
+		end
+		local function emit()
+			if opt.Callback then task.spawn(opt.Callback, obj.Value) end
+		end
+		function obj:Set(color, silent)
+			h, s, v = color:ToHSV()
+			paint()
+			if not silent then emit() end
+		end
+		function obj:Get() return self.Value end
+		function obj:Toggle(state)
+			self.Expanded = state
+			tween(card, { Size = UDim2.new(1, 0, 0, state and (52 + PICK_H + 14) or 44) }, 0.4)
+			tween(arrow, { Rotation = state and 180 or 0 }, 0.3)
+		end
+		function obj:Serialize()
+			return { math.floor(self.Value.R * 255 + 0.5), math.floor(self.Value.G * 255 + 0.5), math.floor(self.Value.B * 255 + 0.5) }
+		end
+		function obj:Deserialize(c)
+			if type(c) == "table" and #c == 3 then self:Set(Color3.fromRGB(c[1], c[2], c[3])) end
+		end
+
+		dragArea(sv, function(p)
+			s = math.clamp((p.X - sv.AbsolutePosition.X) / math.max(sv.AbsoluteSize.X, 1), 0, 1)
+			v = 1 - math.clamp((p.Y - sv.AbsolutePosition.Y) / math.max(sv.AbsoluteSize.Y, 1), 0, 1)
+			paint(); emit()
+		end)
+		dragArea(hue, function(p)
+			h = math.clamp((p.Y - hue.AbsolutePosition.Y) / math.max(hue.AbsoluteSize.Y, 1), 0, 0.999)
+			paint(); emit()
+		end)
+
+		hoverable(card, st, hit)
+		hit.InputBegan:Connect(function(input)
+			if isPress(input) then ripple(hit, input.Position.X) end
+		end)
+		hit.MouseButton1Click:Connect(function() obj:Toggle(not obj.Expanded) end)
+		paint()
+		register(opt, obj)
+		return obj
+	end
+
+	function tab:SetBadge(value)
+		if value == nil or value == 0 or value == "" then
+			tween(tab.BadgeScale, { Scale = 0 }, 0.25, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+			return
+		end
+		tab.BadgeChip.Text = tostring(value)
+		tab.BadgeChip.Visible = true
+		tab.BadgeScale.Scale = 0
+		tween(tab.BadgeScale, { Scale = 1 }, 0.45, Enum.EasingStyle.Back)
+	end
+end
+
+function Library:AddTab(name, description)
+	local index = #self.Tabs + 1
+	local y = TAB_START + (index - 1) * (TAB_H + TAB_GAP)
+	local rowW = self.SidebarW - 16
+	local tab = { Name = name, Y = y, Active = false, Window = self }
+
+	local row = new("CanvasGroup", {
+		Name = name, Size = UDim2.fromOffset(rowW, TAB_H),
+		Position = self.Ready and UDim2.fromOffset(8, y) or UDim2.fromOffset(-10, y),
+		BackgroundTransparency = 1, GroupTransparency = self.Ready and 0 or 1, ZIndex = 2, Parent = self.Sidebar,
+	})
+	local rowScale = new("UIScale", { Parent = row })
+	local button = new("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = row,
+	})
+	local badge = new("Frame", {
+		Size = UDim2.fromOffset(24, 24), Position = UDim2.fromOffset(12, 8),
+		BackgroundColor3 = Theme.Stroke, Parent = button,
+	}, { corner(7) })
+	local badgeText = new("TextLabel", {
+		Text = string.format("%02d", index), Font = Theme.FontBold, TextSize = 10, TextColor3 = Theme.SubText,
+		BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = badge,
+	})
+	local label = new("TextLabel", {
+		Text = name, Font = Theme.Font, TextSize = 13, TextColor3 = Theme.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(46, 0), Size = UDim2.new(1, -60, 1, 0), Parent = button,
+	})
+	local chip = new("TextLabel", {
+		Text = "", Font = Theme.FontBold, TextSize = 10, TextColor3 = WHITE, Visible = false,
+		AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 18),
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), BackgroundColor3 = Theme.Accent,
+		Parent = button,
+	}, { round(), padding(6, 6, 0, 0) })
+	bindColor(chip, "BackgroundColor3")
+	local chipScale = new("UIScale", { Scale = 0, Parent = chip })
+
+	bind(function(a)
+		if tab.Active then badge.BackgroundColor3 = a end
+	end)
+	function tab:_setActive(active)
+		self.Active = active
+		tween(badge, { BackgroundColor3 = active and Theme.Accent or Theme.Stroke }, 0.3)
+		tween(badgeText, { TextColor3 = active and WHITE or Theme.SubText }, 0.3)
+		tween(label, { TextColor3 = active and Theme.Text or Theme.SubText, Position = UDim2.fromOffset(46, 0) }, 0.3)
+	end
+
+	button.MouseEnter:Connect(function()
+		if not tab.Active and not self.Collapsed then
+			tween(label, { TextColor3 = Theme.Text, Position = UDim2.fromOffset(50, 0) }, 0.2)
+		end
+		if not tab.Active then tween(badge, { BackgroundColor3 = Theme.StrokeHi }, 0.2) end
+	end)
+	button.MouseLeave:Connect(function()
+		if not tab.Active then
+			tween(label, { TextColor3 = Theme.SubText, Position = UDim2.fromOffset(46, 0) }, 0.25)
+			tween(badge, { BackgroundColor3 = Theme.Stroke }, 0.25)
+		end
+	end)
+	button.MouseButton1Down:Connect(function() tween(rowScale, { Scale = 0.96 }, 0.08) end)
+	button.MouseButton1Up:Connect(function() tween(rowScale, { Scale = 1 }, 0.25, Enum.EasingStyle.Back) end)
+	button.MouseLeave:Connect(function() tween(rowScale, { Scale = 1 }, 0.2) end)
+	self:AttachTooltip(button, function() return self.Collapsed and name or nil end)
+
+	local page = new("CanvasGroup", {
+		Name = name, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+		GroupTransparency = 1, Visible = false, Parent = self.Pages,
+	})
+	local scroll = new("ScrollingFrame", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.StrokeHi,
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Parent = page,
+	}, {
+		padding(26, 26, 22, 26),
+		new("UIListLayout", { Padding = UDim.new(0, 12), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+	bindColor(scroll, "ScrollBarImageColor3")
+	local header = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 62), BackgroundTransparency = 1, LayoutOrder = 0, Parent = scroll,
+	})
+	new("TextLabel", {
+		Text = name, Font = Theme.FontBold, TextSize = 22, TextColor3 = Theme.Text,
+		TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 26), Parent = header,
+	})
+	new("TextLabel", {
+		Text = description or "", Font = Theme.Font, TextSize = 12, TextColor3 = Theme.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(0, 30), Size = UDim2.new(1, 0, 0, 16), Parent = header,
+	})
+	local underline = new("Frame", {
+		Size = UDim2.fromOffset(0, 3), Position = UDim2.fromOffset(0, 54),
+		BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = header,
+	}, { corner(2) })
+	local ulGrad = new("UIGradient", { Parent = underline })
+	bindGradient(ulGrad)
+
+	local content = new("Frame", {
+		Name = "Content", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1, LayoutOrder = 1, Parent = scroll,
+	}, { new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }) })
+
+	local placeholder = new("Frame", {
+		Name = "Placeholder", Size = UDim2.new(1, 0, 0, 176), BackgroundColor3 = Theme.Card,
+		LayoutOrder = 0, Parent = content,
+	}, { corner(10), stroke(Theme.Stroke) })
+	for i, w in ipairs({ 1, 0.82, 0.58 }) do
+		local bar = new("Frame", {
+			Size = UDim2.new(w, -36 * w, 0, 26), Position = UDim2.fromOffset(18, 18 + (i - 1) * 38),
+			BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = placeholder,
+		}, { corner(7) })
+		local g = new("UIGradient", {
+			Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(33, 36, 48)),
+				ColorSequenceKeypoint.new(0.5, Color3.fromRGB(50, 54, 72)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(33, 36, 48)),
+			}),
+			Parent = bar,
+		})
+		table.insert(self.Shimmers, { g = g, p = index * 0.3 + i * 0.15 })
+	end
+	new("TextLabel", {
+		Text = "Nenhum controle adicionado ainda", Font = Theme.Font, TextSize = 12, TextColor3 = Theme.SubText,
+		BackgroundTransparency = 1, Position = UDim2.new(0, 0, 1, -34), Size = UDim2.new(1, 0, 0, 20), Parent = placeholder,
+	})
+
+	tab.Row, tab.Button, tab.Label = row, button, label
+	tab.BadgeChip, tab.BadgeScale = chip, chipScale
+	tab.Page, tab.Content, tab.Placeholder, tab.Underline = page, content, placeholder, underline
+
+	attachComponents(tab, self)
+
+	button.MouseButton1Click:Connect(function() self:SelectTab(tab) end)
+	self:AddCommand("Ir para " .. name, "Aba", function() self:SelectTab(tab) end)
+
+	table.insert(self.Tabs, tab)
+	if index == 1 then self:SelectTab(tab, true) end
+	return tab
+end
+
+local Window = Library.new("Zyon Menu", "v1.0")
+
+local tabESP    = Window:AddTab("ESP / Visual",       "Opcoes de visualizacao e overlays")
+local tabAimbot = Window:AddTab("Aimbot",             "Configuracoes de mira")
+local tabGun    = Window:AddTab("Gun mods",           "Modificacoes de armas")
+local tabMove   = Window:AddTab("Movimento",          "Controles de locomocao")
+local tabPlayer = Window:AddTab("Player / Utilidade", "Ferramentas do jogador e utilidades")
+local tabInfo   = Window:AddTab("Info / Recon",       "Informacoes do jogo e dos jogadores")
+local tabWorld  = Window:AddTab("Mundo / Portas",    "Portas, givers e itens do mapa")
+local tabSystem = Window:AddTab("Sistema",            "Configuracoes do menu e do script")
+
+tabSystem:AddSection("Aparencia")
+
+local themeNames = {}
+for _, th in ipairs(Themes) do table.insert(themeNames, th[1]) end
+
+local accentPicker
+tabSystem:AddDropdown({
+	Name = "Tema de cor",
+	Options = themeNames,
+	Default = themeNames[1],
+	Flag = "Tema",
+	Callback = function(name)
+		local th = Window:SetTheme(name)
+		if th and accentPicker then accentPicker:Set(th[2], true) end
+		if not Window.Loading then
+			Window:Notify("Tema aplicado", "Esquema de cores: " .. name, 2.5, "success")
+		end
+	end,
+})
+accentPicker = tabSystem:AddColorPicker({
+	Name = "Cor de destaque personalizada",
+	Default = Themes[1][2],
+	Flag = "CorDestaque",
+	Callback = function(c)
+		local h, s, v = c:ToHSV()
+		local c2 = Color3.fromHSV((h + 0.1) % 1, math.clamp(s, 0.35, 1), math.clamp(v, 0.7, 1))
+		Window:SetAccent(c, c2, true)
+	end,
+})
+tabSystem:AddSlider({
+	Name = "Opacidade da janela",
+	Min = 0, Max = 40, Default = 0, Increment = 1, Suffix = "%",
+	Flag = "Opacidade",
+	Callback = function(v)
+		Window.BaseT = v / 100
+		if Window.Open then tween(Window.Main, { GroupTransparency = Window.BaseT }, 0.2) end
+	end,
+})
+tabSystem:AddSlider({
+	Name = "Velocidade das animacoes",
+	Min = 0.5, Max = 2, Default = 1, Increment = 0.1, Suffix = "x",
+	Flag = "VelocidadeAnim",
+	Callback = function(v) Theme.Speed = v end,
+})
+tabSystem:AddToggle({
+	Name = "Particulas de fundo",
+	Default = true,
+	Flag = "Particulas",
+	Callback = function(v) Window.ParticleFrame.Visible = v end,
+})
+tabSystem:AddToggle({
+	Name = "Borda animada",
+	Default = true,
+	Flag = "BordaAnimada",
+	Callback = function(v)
+		Window.BorderAnim = v
+		if not v then Window.StrokeGrad.Rotation = 0 end
+	end,
+})
+tabSystem:AddToggle({
+	Name = "Barra lateral compacta",
+	Default = false,
+	Flag = "BarraCompacta",
+	Callback = function(v) Window:SetCollapsed(v) end,
+})
+
+-- ==========================================================================
+-- ZYON MENU - funcoes do cheat
+-- liga nos modulos prison_esp / prison_move / prison_util / prison_aim
+-- que compartilham o estado __ZYON_STATE
+-- ==========================================================================
+
+local S = __ZYON_STATE
+
+-- estado sempre presente (mesmo arquivo)
+
+
+local CFG = S.config
+local MOV = S.move
+local UTL = S.util
+local AIM = S.aim
+local APPLY = S.move_apply or {}
+
+local function set(tbl, key, value)
+	tbl[key] = value
+end
+
+-- ==========================================================================
+-- ABA: ESP / VISUAL
+-- ==========================================================================
+
+tabESP:AddSection("Jogadores")
+
+tabESP:AddToggle({
+	Name = "Caixa",
+	Description = "Retangulo ao redor de cada jogador",
+	Default = true,
+	Flag = "esp_box",
+	Callback = function(v) set(CFG, "player_box", v) end,
+})
+
+tabESP:AddToggle({
+	Name = "Nome e time",
+	Default = true,
+	Flag = "esp_nome",
+	Callback = function(v) set(CFG, "player_name", v) end,
+})
+
+tabESP:AddToggle({
+	Name = "Barra de vida",
+	Default = true,
+	Flag = "esp_vida",
+	Callback = function(v) set(CFG, "player_health", v) end,
+})
+
+tabESP:AddToggle({
+	Name = "Distancia",
+	Default = true,
+	Flag = "esp_dist",
+	Callback = function(v) set(CFG, "player_distance", v) end,
+})
+
+tabESP:AddToggle({
+	Name = "Tracers",
+	Description = "Linha da base da tela ate o alvo",
+	Default = false,
+	Flag = "esp_tracer",
+	Callback = function(v) set(CFG, "tracer", v) end,
+})
+
+tabESP:AddToggle({
+	Name = "Chams",
+	Description = "Modelo do jogador atraves da parede",
+	Default = false,
+	Flag = "esp_chams",
+	Callback = function(v) set(CFG, "player_chams", v) end,
+})
+
+tabESP:AddSlider({
+	Name = "Alcance do ESP",
+	Min = 50, Max = 5000, Default = 2000, Increment = 50, Suffix = " studs",
+	Flag = "esp_alcance",
+	Callback = function(v) set(CFG, "max_distance", v) end,
+})
+
+tabESP:AddSection("Cenario e itens")
+
+tabESP:AddToggle({
+	Name = "Givers (inclui ocultos)",
+	Description = "Mostra armas do mapa, inclusive as escondidas pelo seu time",
+	Default = true,
+	Flag = "esp_givers",
+	Callback = function(v) set(CFG, "giver_esp", v) end,
+})
+
+tabESP:AddToggle({
+	Name = "Fullbright",
+	Default = false,
+	Flag = "util_fb",
+	Callback = function(v)
+		set(UTL, "fullbright", v)
+		if S.util and S.util.apply_lighting then S.util.apply_lighting() end
+	end,
+})
+
+tabESP:AddToggle({
+	Name = "Sem nevoa",
+	Default = false,
+	Flag = "util_fog",
+	Callback = function(v)
+		set(UTL, "no_fog", v)
+		if S.util and S.util.apply_lighting then S.util.apply_lighting() end
+	end,
+})
+
+tabESP:AddToggle({
+	Name = "FOV personalizado",
+	Default = false,
+	Flag = "util_fov_on",
+	Callback = function(v)
+		set(UTL, "fov_enabled", v)
+		if S.util and S.util.apply_lighting then S.util.apply_lighting() end
+	end,
+})
+
+tabESP:AddSlider({
+	Name = "FOV",
+	Min = 40, Max = 140, Default = 90, Increment = 5,
+	Flag = "util_fov_val",
+	Callback = function(v)
+		set(UTL, "fov_value", v)
+		if UTL.fov_enabled and S.util and S.util.apply_lighting then S.util.apply_lighting() end
+	end,
+})
+
+-- ==========================================================================
+-- ABA: AIMBOT
+-- ==========================================================================
+
+tabAimbot:AddSection("Mira")
+
+tabAimbot:AddToggle({
+	Name = "Aimbot",
+	Description = "Gruda a mira no alvo. Tecla: " .. (AIM.toggleKey and AIM.toggleKey.Name or "G"),
+	Default = false,
+	Flag = "aim_on",
+	Callback = function(v) set(AIM, "enabled", v) end,
+})
+
+tabAimbot:AddSlider({
+	Name = "FOV",
+	Min = 20, Max = 2000, Default = 400, Increment = 10,
+	Flag = "aim_fov",
+	Callback = function(v) set(AIM, "fov", v) end,
+})
+
+tabAimbot:AddSlider({
+	Name = "Suavidade",
+	Description = "0 = trava na hora, 100 = quase nao move",
+	Min = 0, Max = 100, Default = 0, Increment = 5, Suffix = "%",
+	Flag = "aim_smooth",
+	Callback = function(v) set(AIM, "smoothness", v / 100) end,
+})
+
+tabAimbot:AddDropdown({
+	Name = "Parte do corpo",
+	Options = { "Head", "Torso" },
+	Default = "Head",
+	Flag = "aim_parte",
+	Callback = function(v) set(AIM, "part", v) end,
+})
+
+tabAimbot:AddKeybind({
+	Name = "Tecla do aimbot",
+	Description = "Liga e desliga a mira (padrao G; E e do jogo)",
+	Default = Enum.KeyCode.G,
+	Flag = "aim_tecla",
+	Changed = function(key) set(AIM, "toggleKey", key) end,
+	Callback = function()
+		AIM.enabled = not AIM.enabled
+		local sw = Window.Flags and Window.Flags["aim_on"]
+		if sw and sw.Value ~= AIM.enabled then sw:Set(AIM.enabled, true) end
+	end,
+})
+
+tabAimbot:AddSection("Filtros")
+
+tabAimbot:AddToggle({
+	Name = "So quem esta armado",
+	Description = "Ignora jogador sem arma",
+	Default = true,
+	Flag = "aim_armed",
+	Callback = function(v) set(AIM, "armed_only", v) end,
+})
+
+tabAimbot:AddToggle({
+	Name = "Arma na mochila conta",
+	Default = true,
+	Flag = "aim_bp",
+	Callback = function(v) set(AIM, "armed_backpack", v) end,
+})
+
+tabAimbot:AddToggle({
+	Name = "So time inimigo",
+	Description = "Guard pega Inmate/Criminal, Inmate pega Guard",
+	Default = true,
+	Flag = "aim_enemy",
+	Callback = function(v) set(AIM, "armed_enemies_only", v) end,
+})
+
+tabAimbot:AddToggle({
+	Name = "So alvo visivel",
+	Description = "Nao trava em quem esta atras de parede",
+	Default = true,
+	Flag = "aim_vis",
+	Callback = function(v) set(AIM, "visible_only", v) end,
+})
+
+tabAimbot:AddToggle({
+	Name = "Visao 360",
+	Description = "Pega alvo em qualquer direcao, inclusive atras de voce",
+	Default = true,
+	Flag = "aim_360",
+	Callback = function(v) set(AIM, "vision_360", v) end,
+})
+
+tabAimbot:AddSlider({
+	Name = "Alcance do aimbot",
+	Min = 30, Max = 2000, Default = 1000, Increment = 10, Suffix = " studs",
+	Flag = "aim_range",
+	Callback = function(v) set(AIM, "max_range", v) end,
+})
+
+tabAimbot:AddToggle({
+	Name = "Atravessar parede",
+	Description = "Trava mesmo sem linha de visao (o tiro pode nao passar)",
+	Default = false,
+	Flag = "aim_wall",
+	Callback = function(v) set(AIM, "wall_aim", v) end,
+})
+
+tabAimbot:AddToggle({
+	Name = "Mostrar circulo do FOV",
+	Default = true,
+	Flag = "aim_circle",
+	Callback = function(v) set(AIM, "show_fov", v) end,
+})
+
+tabAimbot:AddButton({
+	Name = "Quem o aimbot pode pegar agora",
+	Callback = function()
+		local Players = game:GetService("Players")
+		local me = Players.LocalPlayer
+		local myTeam = me.Team and me.Team.Name
+		local lista, total = {}, 0
+		for _, pl in ipairs(Players:GetPlayers()) do
+			if pl ~= me and pl.Character then
+				local h = pl.Character:FindFirstChildOfClass("Humanoid")
+				if h and h.Health > 0 then
+					local t = pl.Team and pl.Team.Name
+					local inimigo = (t and myTeam and t ~= myTeam and t ~= "Neutral" and myTeam ~= "Neutral")
+					local armed, wname = S.has_weapon(pl)
+					if inimigo and armed then
+						total = total + 1
+						if total <= 6 then
+							table.insert(lista, pl.Name .. " (" .. tostring(wname) .. ")")
+						end
+					end
+				end
+			end
+		end
+		if total == 0 then
+			Window:Notify("Nenhum alvo", "Ninguem armado do time inimigo agora.", 4, "warn")
+		else
+			Window:Notify(total .. " alvo(s) valido(s)", table.concat(lista, ", "), 5, "info")
+		end
+	end,
+})
+
+-- ==========================================================================
+-- ABA: GUN MODS
+-- ==========================================================================
+
+tabGun:AddSection("Recoil e precisao")
+
+tabGun:AddToggle({
+	Name = "Sem recoil",
+	Description = "Zera o espalhamento da arma equipada",
+	Default = false,
+	Flag = "gun_recoil",
+	Callback = function(v)
+		local lp = game:GetService("Players").LocalPlayer
+		local ch = lp.Character
+		local tool = ch and ch:FindFirstChildOfClass("Tool")
+		if not tool then
+			Window:Notify("Sem arma", "Equipe uma arma primeiro.", 3, "warn")
+			return
+		end
+		if v then
+			if not tool:GetAttribute("ZyonOriginalSpread") then
+				tool:SetAttribute("ZyonOriginalSpread", tool:GetAttribute("SpreadRadius") or 0.0181)
+			end
+			tool:SetAttribute("SpreadRadius", 0)
+			Window:Notify("Sem recoil", "Ativado em " .. tool.Name, 2.5, "success")
+		else
+			local orig = tool:GetAttribute("ZyonOriginalSpread")
+			tool:SetAttribute("SpreadRadius", orig or 0.0181)
+			Window:Notify("Recoil", "Restaurado", 2.5, "info")
+		end
+	end,
+})
+
+tabGun:AddButton({
+	Name = "Mostrar municao da arma",
+	Callback = function()
+		local lp = game:GetService("Players").LocalPlayer
+		local ch = lp.Character
+		local tool = ch and ch:FindFirstChildOfClass("Tool")
+		if not tool then
+			Window:Notify("Sem arma", "Equipe uma arma primeiro.", 3, "warn")
+			return
+		end
+		local ammo = tool:GetAttribute("Local_CurrentAmmo")
+		Window:Notify(tool.Name, "Municao: " .. tostring(ammo), 3, "info")
+	end,
+})
+
+tabGun:AddLabel("Aviso: o servidor ignora dano vindo de remote forjado. Estas funcoes so afetam o cliente.")
+
+-- ==========================================================================
+-- ABA: MOVIMENTO
+-- ==========================================================================
+
+tabMove:AddSection("Velocidade")
+
+tabMove:AddToggle({
+	Name = "Speed hack",
+	Default = false,
+	Flag = "mov_speed_on",
+	Callback = function(v)
+		set(MOV, "speed_enabled", v)
+		if APPLY.speed then APPLY.speed() end
+	end,
+})
+
+tabMove:AddSlider({
+	Name = "Velocidade",
+	Min = 16, Max = 300, Default = 60, Increment = 2,
+	Flag = "mov_speed_val",
+	Callback = function(v)
+		set(MOV, "speed_value", v)
+		if MOV.speed_enabled and APPLY.speed then APPLY.speed() end
+	end,
+})
+
+tabMove:AddSection("Pulo e gravidade")
+
+tabMove:AddToggle({
+	Name = "Jump power",
+	Default = false,
+	Flag = "mov_jump_on",
+	Callback = function(v)
+		set(MOV, "jump_enabled", v)
+		if APPLY.jump then APPLY.jump() end
+	end,
+})
+
+tabMove:AddSlider({
+	Name = "Forca do pulo",
+	Min = 50, Max = 500, Default = 120, Increment = 10,
+	Flag = "mov_jump_val",
+	Callback = function(v)
+		set(MOV, "jump_value", v)
+		if MOV.jump_enabled and APPLY.jump then APPLY.jump() end
+	end,
+})
+
+tabMove:AddToggle({
+	Name = "Gravidade custom",
+	Default = false,
+	Flag = "mov_grav_on",
+	Callback = function(v)
+		set(MOV, "gravity_enabled", v)
+		if APPLY.gravity then APPLY.gravity() end
+	end,
+})
+
+tabMove:AddSlider({
+	Name = "Gravidade",
+	Min = 0, Max = 400, Default = 120, Increment = 10,
+	Flag = "mov_grav_val",
+	Callback = function(v)
+		set(MOV, "gravity_value", v)
+		if MOV.gravity_enabled and APPLY.gravity then APPLY.gravity() end
+	end,
+})
+
+tabMove:AddSection("Voo")
+
+tabMove:AddToggle({
+	Name = "Fly",
+	Description = "WASD move, Space sobe, Ctrl desce",
+	Default = false,
+	Flag = "mov_fly_on",
+	Callback = function(v) set(MOV, "fly_enabled", v) end,
+})
+
+tabMove:AddSlider({
+	Name = "Velocidade do voo",
+	Min = 10, Max = 300, Default = 55, Increment = 5,
+	Flag = "mov_fly_val",
+	Callback = function(v) set(MOV, "fly_speed", v) end,
+})
+
+tabMove:AddSection("Extras")
+
+tabMove:AddButton({
+	Name = "Matar AntiJump",
+	Callback = function()
+		if S.kill_antijump() then
+			Window:Notify("AntiJump", "Removido deste personagem.", 3, "success")
+		else
+			Window:Notify("AntiJump", "Nao encontrado neste personagem.", 3, "warn")
+		end
+	end,
+})
+
+tabMove:AddButton({
+	Name = "Restaurar movimento",
+	Callback = function()
+		MOV.speed_enabled = false
+		MOV.jump_enabled = false
+		MOV.gravity_enabled = false
+		MOV.fly_enabled = false
+		if APPLY.speed then APPLY.speed() end
+		if APPLY.jump then APPLY.jump() end
+		if APPLY.gravity then APPLY.gravity() end
+		if APPLY.fly then APPLY.fly() end
+		Window:Notify("Movimento", "Restaurado ao padrao.", 3, "success")
+	end,
+})
+
+-- ==========================================================================
+-- ABA: PLAYER / UTILIDADE
+-- ==========================================================================
+
+tabPlayer:AddSection("Teleporte")
+
+tabPlayer:AddButton({
+	Name = "Listar jogadores proximos",
+	Callback = function()
+		local Players = game:GetService("Players")
+		local me = Players.LocalPlayer
+		local ch = me.Character
+		if not ch or not ch.PrimaryPart then return end
+		local pos = ch.PrimaryPart.Position
+		local lista = {}
+		for _, pl in ipairs(Players:GetPlayers()) do
+			if pl ~= me and pl.Character then
+				local hrp = pl.Character:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					local d = (hrp.Position - pos).Magnitude
+					if d < 200 then
+						table.insert(lista, string.format("%s (%d)", pl.Name, math.floor(d)))
+					end
+				end
+			end
+		end
+		if #lista == 0 then
+			Window:Notify("Ninguem perto", "Nenhum jogador em 200 studs.", 3, "warn")
+		else
+			Window:Notify(#lista .. " perto", table.concat(lista, ", "), 6, "info")
+		end
+	end,
+})
+
+tabPlayer:AddButton({
+	Name = "Ir para o giver mais proximo",
+	Callback = function()
+		local ok, tool = S.go_to_giver()
+		if ok then
+			Window:Notify("Giver", "Indo para " .. tostring(tool), 3, "success")
+		else
+			Window:Notify("Giver", "Nenhum giver no mapa.", 3, "warn")
+		end
+	end,
+})
+
+tabPlayer:AddInput({
+	Name = "Ir para giver (nome)",
+	Placeholder = "M4A1, MP5, M700...",
+	Flag = "_giverNome",
+	NoConfig = true,
+	Live = true,
+})
+
+tabPlayer:AddSection("Inventario alheio")
+
+tabPlayer:AddButton({
+	Name = "Espionar inventarios",
+	Callback = function()
+		local inv = S.all_inventories()
+		local count, mostrados = 0, 0
+		for nome, dados in pairs(inv) do
+			local itens = {}
+			for _, i in ipairs(dados.character) do table.insert(itens, i) end
+			for _, i in ipairs(dados.backpack) do table.insert(itens, i .. " (bolsa)") end
+			if #itens > 0 then
+				count = count + 1
+				if mostrados < 5 then
+					Window:Notify(nome, table.concat(itens, ", "), 5, "info")
+					mostrados = mostrados + 1
+				end
+			end
+		end
+		if count == 0 then
+			Window:Notify("Inventarios", "Ninguem com item.", 3, "warn")
+		elseif count > mostrados then
+			Window:Notify("Mais jogadores", (count - mostrados) .. " outros com itens.", 4, "info")
+		end
+	end,
+})
+
+-- ==========================================================================
+-- ABA: MUNDO / PORTAS
+-- ==========================================================================
+
+tabWorld:AddSection("Portas")
+
+tabWorld:AddButton({
+	Name = "Abrir todas as portas",
+	Callback = function()
+		local n = S.open_all_doors()
+		Window:Notify("Portas", tostring(n) .. " abertas.", 3, "success")
+	end,
+})
+
+tabWorld:AddButton({
+	Name = "Fechar todas as portas",
+	Callback = function()
+		local n = S.close_all_doors()
+		Window:Notify("Portas", tostring(n) .. " fechadas.", 3, "info")
+	end,
+})
+
+tabWorld:AddKeybind({
+	Name = "Abrir portas (tecla)",
+	Default = Enum.KeyCode.J,
+	Flag = "world_door_key",
+	Callback = function()
+		local n = S.open_all_doors()
+		Window:Notify("Portas", tostring(n) .. " abertas.", 2, "success")
+	end,
+})
+
+tabWorld:AddSection("Givers")
+
+tabWorld:AddButton({
+	Name = "Listar givers do mapa",
+	Callback = function()
+		local g = S.list_givers()
+		if #g == 0 then
+			Window:Notify("Givers", "Nenhum encontrado.", 3, "warn")
+			return
+		end
+		local mostrados = math.min(#g, 6)
+		for i = 1, mostrados do
+			local item = g[i]
+			Window:Notify(
+				item.tool .. " [" .. item.team .. "]",
+				string.format("%d studs%s", math.floor(item.distance), item.hidden and " - OCULTO" or ""),
+				5, item.hidden and "warn" or "info"
+			)
+		end
+		if #g > mostrados then
+			Window:Notify("Total", tostring(#g) .. " givers no mapa.", 4, "info")
+		end
+	end,
+})
+
+-- ==========================================================================
+-- ABA: INFO / RECON
+-- ==========================================================================
+
+tabInfo:AddSection("Meu estado")
+
+local infoLabel = tabInfo:AddLabel("Carregando...")
+
+task.spawn(function()
+	while task.wait(2) do
+		local lp = game:GetService("Players").LocalPlayer
+		local ch = lp.Character
+		local h = ch and ch:FindFirstChildOfClass("Humanoid")
+		local tool = ch and ch:FindFirstChildOfClass("Tool")
+		local Players = game:GetService("Players")
+		local armed = 0
+		for _, pl in ipairs(Players:GetPlayers()) do
+			if pl ~= lp and S.has_weapon(pl) then armed = armed + 1 end
+		end
+		local txt = string.format(
+			"Time: %s   |   Vida: %s   |   Arma: %s   |   Armados no servidor: %d   |   Vel: %d",
+			tostring(lp.Team and lp.Team.Name),
+			tostring(h and math.floor(h.Health) or "-"),
+			tool and tool.Name or "nenhuma",
+			armed,
+			h and math.floor(h.WalkSpeed) or 0
+		)
+		if infoLabel then
+			pcall(function() infoLabel.Text = txt end)
+		end
+	end
+end)
+
+tabInfo:AddButton({
+	Name = "Analisar servidor",
+	Callback = function()
+		local Players = game:GetService("Players")
+		local me = Players.LocalPlayer
+		local times = {}
+		for _, pl in ipairs(Players:GetPlayers()) do
+			local t = pl.Team and pl.Team.Name or "?"
+			times[t] = (times[t] or 0) + 1
+		end
+		local partes = {}
+		for t, n in pairs(times) do table.insert(partes, t .. ": " .. n) end
+		table.sort(partes)
+		Window:Notify(#Players:GetPlayers() .. " jogadores", table.concat(partes, "  "), 6, "info")
+	end,
+})
+
+-- ==========================================================================
+-- ABA: SISTEMA - comandos extras
+-- ==========================================================================
+
+tabSystem:AddSection("Estado dos modulos")
+
+tabSystem:AddButton({
+	Name = "Mostrar estado dos modulos",
+	Callback = function()
+		local S2 = __ZYON_STATE
+		if not S2 then
+			Window:Notify("Modulos", "Nenhum carregado.", 4, "error")
+			return
+		end
+		local partes = {}
+		if S2.config then table.insert(partes, "esp") end
+		if S2.move then table.insert(partes, "move") end
+		if S2.util then table.insert(partes, "util") end
+		if S2.aim then table.insert(partes, "aim") end
+		Window:Notify("Modulos ativos", table.concat(partes, ", "), 4, "success")
+	end,
+})
+
+tabSystem:AddButton({
+	Name = "Desligar tudo (panico)",
+	Callback = function()
+		local S2 = __ZYON_STATE
+		if not S2 then return end
+		if S2.config then
+			S2.config.player_box = false
+			S2.config.player_name = false
+			S2.config.player_health = false
+			S2.config.tracer = false
+			S2.config.player_chams = false
+			S2.config.giver_esp = false
+		end
+		if S2.move then
+			S2.move.speed_enabled = false
+			S2.move.fly_enabled = false
+			S2.move.jump_enabled = false
+			S2.move.gravity_enabled = false
+		end
+		if S2.aim then S2.aim.enabled = false end
+		if S2.move_apply then
+			pcall(S2.move_apply.speed)
+			pcall(S2.move_apply.jump)
+			pcall(S2.move_apply.gravity)
+			pcall(S2.move_apply.fly)
+		end
+		Window:Notify("Panico", "Todas as funcoes desligadas.", 4, "success")
+	end,
+})
+
+
+
+
+
+tabSystem:AddSection("Atalhos")
+tabSystem:AddKeybind({
+	Name = "Mostrar / ocultar menu",
+	Default = Enum.KeyCode.RightShift,
+	Flag = "TeclaMenu",
+	Changed = function(key)
+		Window.ToggleKey = key
+		if not Window.Loading then
+			Window:Notify("Atalho atualizado", "Nova tecla: " .. key.Name, 2.5, "info")
+		end
+	end,
+})
+
+tabSystem:AddSection("Perfis")
+local cfgName = tabSystem:AddInput({
+	Name = "Nome do perfil",
+	Placeholder = "ex: meu-perfil",
+	Default = "padrao",
+	Flag = "_cfgNome",
+	NoConfig = true,
+	Live = true,
+})
+local cfgList = tabSystem:AddDropdown({
+	Name = "Perfis salvos",
+	Options = Window:ListConfigs(),
+	Flag = "_cfgLista",
+	NoConfig = true,
+})
+tabSystem:AddButton({
+	Name = "Salvar perfil",
+	Callback = function()
+		local ok, res = Window:SaveConfig(cfgName.Value)
+		if ok then
+			cfgList:Refresh(Window:ListConfigs())
+			cfgList:Set(res, true)
+			Window:Notify("Perfil salvo", '"' .. res .. '" foi salvo.', 3, "success")
+		else
+			Window:Notify("Nao foi possivel salvar", tostring(res), 3, "error")
+		end
+	end,
+})
+tabSystem:AddButton({
+	Name = "Carregar perfil selecionado",
+	Callback = function()
+		local name = cfgList.Value
+		if not name then
+			Window:Notify("Nenhum perfil", "Salve ou selecione um perfil primeiro.", 3, "warn")
+			return
+		end
+		local ok, res = Window:LoadConfig(name)
+		if ok then
+			Window:Notify("Perfil carregado", '"' .. res .. '" aplicado.', 3, "success")
+		else
+			Window:Notify("Nao foi possivel carregar", tostring(res), 3, "error")
+		end
+	end,
+})
+tabSystem:AddButton({
+	Name = "Excluir perfil selecionado",
+	Callback = function()
+		local name = cfgList.Value
+		if not name then return end
+		local ok = Window:DeleteConfig(name)
+		cfgList:Refresh(Window:ListConfigs())
+		Window:Notify(ok and "Perfil excluido" or "Falha ao excluir", '"' .. name .. '"', 3, ok and "success" or "error")
+	end,
+})
+
+tabSystem:AddSection("Interface")
+tabSystem:AddButton({
+	Name = "Descarregar UI",
+	Callback = function() Window:Destroy() end,
+})
+
+-- ==========================================================================
+-- aplica os valores iniciais nos modulos
+-- o AddToggle do UI so muda o visual quando Default e passado; o Callback
+-- nunca roda sozinho. Sem isso o switch aparece ligado mas o modulo fica
+-- com o valor antigo e "nada acontece".
+-- ==========================================================================
+
+local function __aplicar(flag, valor)
+	local obj = Window.Flags and Window.Flags[flag]
+	if obj and obj.Set then
+		obj:Set(valor, true)
+		return true
+	end
+	return false
+end
+
+task.spawn(function()
+	task.wait(0.25)
+
+	-- expoe a janela pro aimbot checar se o usuario esta remapeando tecla
+	getgenv().__ZYON_WINDOW = Window
+
+	-- a tecla do aimbot tambem mexe no switch da UI
+	local aimToggleObj = Window.Flags and Window.Flags["aim_on"]
+	AIM.onToggle = function(valor)
+		if aimToggleObj and aimToggleObj.Value ~= valor then
+			aimToggleObj:Set(valor, true)
+		end
+	end
+
+	-- ESP ligado por padrao
+	__aplicar("esp_box", true)
+	__aplicar("esp_nome", true)
+	__aplicar("esp_vida", true)
+	__aplicar("esp_dist", true)
+	__aplicar("esp_givers", true)
+	__aplicar("esp_alcance", 2000)
+	__aplicar("esp_chams", false)
+	__aplicar("esp_tracer", false)
+
+	CFG.player_box = true
+	CFG.player_name = true
+	CFG.player_health = true
+	CFG.player_distance = true
+	CFG.giver_esp = true
+	CFG.player_chams = false
+	CFG.tracer = false
+	CFG.max_distance = 2000
+	CFG.team_colors = CFG.team_colors or {
+		Guards = Color3.fromRGB(90, 160, 255),
+		Inmates = Color3.fromRGB(255, 140, 60),
+		Criminals = Color3.fromRGB(255, 70, 70),
+		Neutral = Color3.fromRGB(180, 180, 180),
+	}
+
+	-- aimbot: valores iniciais, mas desligado
+	__aplicar("aim_fov", 400)
+	__aplicar("aim_smooth", 0)
+	__aplicar("aim_armed", true)
+	__aplicar("aim_bp", true)
+	__aplicar("aim_enemy", true)
+	__aplicar("aim_vis", true)
+	__aplicar("aim_circle", true)
+
+	AIM.fov = 400
+	AIM.smoothness = 0
+	AIM.armed_only = true
+	AIM.armed_backpack = true
+	AIM.armed_enemies_only = true
+	AIM.visible_only = true
+	AIM.show_fov = true
+	AIM.part = "Head"
+	AIM.enabled = false
+	AIM.toggleKey = Enum.KeyCode.G
+	AIM.vision_360 = true
+	AIM.vision_360_angle = 180
+	AIM.max_range = 1000
+	AIM.wall_aim = false
+	__aplicar("aim_360", true)
+	__aplicar("aim_range", 1000)
+	__aplicar("aim_wall", false)
+
+	-- movimento: desligado, valores sincronizados
+	__aplicar("mov_speed_val", 60)
+	__aplicar("mov_jump_val", 120)
+	__aplicar("mov_grav_val", 120)
+	__aplicar("mov_fly_val", 55)
+
+	MOV.speed_value = 60
+	MOV.jump_value = 120
+	MOV.gravity_value = 120
+	MOV.fly_speed = 55
+	MOV.speed_enabled = false
+	MOV.jump_enabled = false
+	MOV.gravity_enabled = false
+	MOV.fly_enabled = false
+
+	-- util: tudo desligado
+	UTL.fullbright = false
+	UTL.no_fog = false
+	UTL.fov_enabled = false
+	UTL.fov_value = 90
+
+	if Window and Window.Notify then
+		pcall(function()
+			Window:Notify("Zyon Menu", "Pronto. RightShift abre e fecha.", 4, "success")
+		end)
+	end
+end)
+
+return Window
