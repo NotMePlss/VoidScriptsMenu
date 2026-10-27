@@ -2928,6 +2928,19 @@ local RARITY_NAMES = { [0] = "Default", [1] = "Common", [2] = "Uncommon", [3] = 
 
 local function readItem(m)
 	local a = m:GetAttributes()
+
+	-- resolve nome/thumb de forma tolerante: atributo, Value filho, ou nome do item
+	local function pick(attrName)
+		local v = a[attrName]
+		if v ~= nil and v ~= "" then return v end
+		local child = m:FindFirstChild(attrName)
+		if child then
+			if child:IsA("ValueBase") then return child.Value end
+			return nil
+		end
+		return nil
+	end
+
 	local model = m:FindFirstChild("Model")
 	local accModel = m:FindFirstChild("AccessoryModel")
 	local wire = model or accModel
@@ -2945,23 +2958,14 @@ local function readItem(m)
 		end
 		if not meshPart then meshPart = anyPart end
 	end
-	local rarity = tonumber(a.Rarity) or 0
-	-- fallback: as vezes os atributos chegam depois; tenta ler props direto
-	local itemName = a.ItemName
-	if not itemName or itemName == "" then
-		local ok, v = pcall(function() return m:GetAttribute("ItemName") end)
-		itemName = ok and v or nil
-	end
-	local thumb = a.Thumbnail
-	if not thumb or thumb == "" then
-		local ok, v = pcall(function() return m:GetAttribute("Thumbnail") end)
-		thumb = ok and v or nil
-	end
+	local rarity = tonumber(pick("Rarity")) or 0
+	local itemName = pick("ItemName")
+	local thumb = pick("Thumbnail")
 	return {
 		key = m.Name,
-		name = (itemName and itemName ~= "" and itemName) or m.Name,
-		thumb = (thumb and thumb ~= "") and thumb or nil,
-		creator = a.CreatorName,
+		name = (itemName and tostring(itemName) ~= "" and tostring(itemName)) or m.Name,
+		thumb = (thumb and tostring(thumb) ~= "") and tostring(thumb) or nil,
+		creator = pick("CreatorName"),
 		rarity = rarity,
 		rarityName = RARITY_NAMES[rarity] or "?",
 		texture = meshPart and meshPart.TextureID ~= "" and meshPart.TextureID or nil,
