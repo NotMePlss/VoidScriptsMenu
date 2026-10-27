@@ -1642,18 +1642,43 @@ function Library.new(title, subtitle)
 		if tip then self:AttachTooltip(b, tip) end
 		return b
 	end
-	topButton("", -40, Theme.Danger, function() self:Hide() end, function()
+	-- X de fechar
+	local closeBtn = topButton("", -40, Theme.Danger, function() self:Hide() end, function()
 		return "Ocultar menu (" .. self.ToggleKey.Name .. " para reabrir)"
 	end)
+	local closeIcon = new("Frame", {
+		Size = UDim2.fromOffset(11, 11), AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1, Parent = closeBtn,
+	})
+	for i = 1, 2 do
+		local bar = new("Frame", {
+			Size = UDim2.fromOffset(13, 2), AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5), Rotation = i == 1 and 45 or -45,
+			BackgroundColor3 = Theme.Text, BorderSizePixel = 0, Parent = closeIcon,
+		}, { corner(1) })
+		closeBtn.MouseEnter:Connect(function() tween(bar, { BackgroundColor3 = Theme.Danger }, 0.15) end)
+		closeBtn.MouseLeave:Connect(function() tween(bar, { BackgroundColor3 = Theme.Text }, 0.2) end)
+	end
+
+	-- quadrado de maximizar
 	local maxBtn = topButton("", -72, Theme.Accent, function() self:ToggleMaximize() end, "Maximizar / restaurar")
 	local maxIcon = new("Frame", {
-		Size = UDim2.fromOffset(10, 10), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(11, 11), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
 		BackgroundTransparency = 1, Parent = maxBtn,
 	}, { corner(2) })
-	local maxStroke = new("UIStroke", { Color = Theme.SubText, Thickness = 1.5, Parent = maxIcon })
-	maxBtn.MouseEnter:Connect(function() tween(maxStroke, { Color = Theme.Text }, 0.15) end)
-	maxBtn.MouseLeave:Connect(function() tween(maxStroke, { Color = Theme.SubText }, 0.2) end)
-	topButton("", -104, Theme.Accent, function() self:Minimize() end, "Minimizar para orbe")
+	local maxStroke = new("UIStroke", { Color = Theme.Text, Thickness = 1.8, Parent = maxIcon })
+	maxBtn.MouseEnter:Connect(function() tween(maxStroke, { Color = Theme.Accent }, 0.15) end)
+	maxBtn.MouseLeave:Connect(function() tween(maxStroke, { Color = Theme.Text }, 0.2) end)
+
+	-- traco de minimizar
+	local minBtn = topButton("", -104, Theme.Accent, function() self:Minimize() end, "Minimizar para orbe")
+	local minIcon = new("Frame", {
+		Size = UDim2.fromOffset(12, 2), AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = Theme.Text,
+		BorderSizePixel = 0, Parent = minBtn,
+	}, { corner(1) })
+	minBtn.MouseEnter:Connect(function() tween(minIcon, { BackgroundColor3 = Theme.Accent }, 0.15) end)
+	minBtn.MouseLeave:Connect(function() tween(minIcon, { BackgroundColor3 = Theme.Text }, 0.2) end)
 
 	local sidebar = new("Frame", {
 		Name = "Sidebar",
