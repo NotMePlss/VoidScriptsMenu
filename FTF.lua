@@ -295,28 +295,44 @@ function Library.new(title, subtitle)
 	bindGradient(strokeGrad, true)
 	local scale = new("UIScale", { Scale = 0.9, Parent = root })
 
-	-- responsivo: encolhe a janela pra caber em qualquer tela (mobile/tablet)
+	-- responsivo: escala a janela pro viewport, com teto de tamanho nativo.
+	-- telas pequenas usam quase toda a area; telas grandes nunca passam de 820x520.
 	do
 		local BASE_W, BASE_H = 820, 520
+		local MIN_SCALE, MAX_SCALE = 0.30, 1.0
 		local camRef = workspace.CurrentCamera
-		local function fitScale()
-			local vp = (camRef and camRef.ViewportSize) or Vector2.new(1280, 720)
-			if vp.X <= 0 or vp.Y <= 0 then return 0.9 end
-			local pad = 20
+		local function fitScale(vp)
+			if not vp or vp.X <= 0 or vp.Y <= 0 then return 0.85 end
+			local pad = (vp.X < 700 or vp.Y < 550) and 8 or 16
 			local sw = (vp.X - pad) / BASE_W
 			local sh = (vp.Y - pad) / BASE_H
-			local s = math.min(sw, sh, 1.35)
-			return math.max(s, 0.3)
+			return math.clamp(math.min(sw, sh), MIN_SCALE, MAX_SCALE)
 		end
 		local function applyFit()
-			scale.Scale = fitScale()
-			root.Position = UDim2.fromScale(0.5, 0.5)
+			local vp = camRef and camRef.ViewportSize
+			root.Size = UDim2.fromOffset(BASE_W, BASE_H)
+			scale.Scale = fitScale(vp)
 			root.AnchorPoint = Vector2.new(0.5, 0.5)
+			root.Position = UDim2.fromScale(0.5, 0.5)
+			-- celular em retrato: a UI e paisagem, entao sobe a janela pra
+			-- nao ficar colada no centro com sobra em cima e embaixo
+			if vp and vp.Y > vp.X * 1.15 then
+				root.Position = UDim2.fromScale(0.5, 0.42)
+			end
 		end
 		applyFit()
 		if camRef then
 			camRef:GetPropertyChangedSignal("ViewportSize"):Connect(applyFit)
 		end
+		workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+			task.wait(0.3)
+			local c = workspace.CurrentCamera
+			if c and c ~= camRef then
+				camRef = c
+				c:GetPropertyChangedSignal("ViewportSize"):Connect(applyFit)
+				applyFit()
+			end
+		end)
 	end
 
 	local main = new("CanvasGroup", {
