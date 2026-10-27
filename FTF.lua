@@ -2941,23 +2941,44 @@ local function readItem(m)
 		return nil
 	end
 
+	-- extrai aparencia de um Model do ItemDatabase.
+	-- ATENCAO: o no chamado "Handle" pode ser Part OU MeshPart conforme o item,
+	-- e o MeshPart real as vezes so existe em "Model". Por isso varre tudo.
+	local function readAppearance(holder)
+		if not holder then return nil end
+		local mesh = nil       -- prefere MeshPart
+		local anyPart = nil    -- aceita Part comum
+		local handleNode = nil
+		for _, c in ipairs(holder:GetDescendants()) do
+			if c:IsA("MeshPart") then
+				if mesh == nil then mesh = c end
+			elseif c:IsA("BasePart") then
+				if anyPart == nil then anyPart = c end
+			end
+			if c.Name == "Handle" and handleNode == nil then handleNode = c end
+		end
+		local node = mesh or handleNode or anyPart
+		if not node then return nil end
+		local tex = nil
+		if node:IsA("MeshPart") then
+			if node.TextureID ~= "" then tex = node.TextureID end
+		elseif node:IsA("Decal") then
+			if node.Texture ~= "" then tex = node.Texture end
+		end
+		return {
+			texture = tex,
+			color = node.Color,
+			material = node.Material,
+			meshId = (node:IsA("MeshPart")) and node.MeshId or nil,
+			className = node.ClassName,
+		}
+	end
+
 	local model = m:FindFirstChild("Model")
 	local accModel = m:FindFirstChild("AccessoryModel")
-	local wire = model or accModel
-	local meshPart = nil
-	local anyPart = nil
-	if wire then
-		for _, c in ipairs(wire:GetDescendants()) do
-			if c:IsA("MeshPart") then
-				-- prioriza o que tem textura
-				if c.TextureID ~= "" and not meshPart then
-					meshPart = c
-				end
-				if not anyPart then anyPart = c end
-			end
-		end
-		if not meshPart then meshPart = anyPart end
-	end
+	-- o que o jogo realmente veste e o AccessoryModel; Model e o preview 3D
+	local appearance = readAppearance(accModel) or readAppearance(model)
+	local meshPart = appearance and { class = appearance.className }
 	local rarity = tonumber(pick("Rarity")) or 0
 	local itemName = pick("ItemName")
 	local thumb = pick("Thumbnail")
@@ -2968,10 +2989,11 @@ local function readItem(m)
 		creator = pick("CreatorName"),
 		rarity = rarity,
 		rarityName = RARITY_NAMES[rarity] or "?",
-		texture = meshPart and meshPart.TextureID ~= "" and meshPart.TextureID or nil,
-		color = meshPart and meshPart.Color or Color3.fromRGB(163, 162, 165),
-		material = meshPart and meshPart.Material or Enum.Material.Plastic,
-		hasMesh = meshPart ~= nil,
+		texture = appearance and appearance.texture or nil,
+		color = appearance and appearance.color or Color3.fromRGB(163, 162, 165),
+		material = appearance and appearance.material or Enum.Material.Plastic,
+		meshId = appearance and appearance.meshId or nil,
+		hasMesh = appearance ~= nil,
 	}
 end
 
@@ -3006,36 +3028,71 @@ function Core.GetSkinCatalog()
 end
 
 -- busca as partes vivas da marreta (dois formatos: Model "Hammer" quando beast,
--- Accessory "PackedHammer" quando survivor)
+-- Accessory "PackedHammer" quando survivor). O no pode ser MeshPart OU Part.
+local function findWearablePart(holder)
+	if not holder then return nil end
+	local mesh, anyBase, handle = nil, nil, nil
+	for _, c in ipairs(holder:GetDescendants()) do
+		if c:IsA("MeshPart") then
+			if mesh == nil then mesh = c end
+		elseif c:IsA("BasePart") then
+			if anyBase == nil then anyBase = c end
+		end
+		if c.Name == "Handle" and handle == nil then handle = c end
+	end
+	return mesh or handle or anyBase
+end
+
 local function getHammerPart()
 	local ch = getChar()
 	if not ch then return nil end
-	local ham = ch:FindFirstChild("Hammer")
-	if ham then
-		local mp = ham:FindFirstChild("MeshPart") or ham:FindFirstChildWhichIsA("MeshPart")
-		if mp then return mp end
-	end
-	local packed = ch:FindFirstChild("PackedHammer")
-	if packed then
-		for _, c in ipairs(packed:GetDescendants()) do
-			if c:IsA("MeshPart") then return c end
-		end
-		local h = packed:FindFirstChild("Handle")
-		if h and h:IsA("MeshPart") then return h end
-	end
-	return nil
+	local part = findWearablePart(ch:FindFirstChild("Hammer"))
+	if part then return part end
+	return findWearablePart(ch:FindFirstChild("PackedHammer"))
 end
 
 local function getGemPart()
 	local ch = getChar()
 	if not ch then return nil end
-	local gem = ch:FindFirstChild("Gemstone")
-	local holder = gem or ch:FindFirstChild("PackedGemstone")
-	if not holder then return nil end
-	for _, c in ipairs(holder:GetDescendants()) do
-		if c:IsA("MeshPart") then return c end
+	local part = findWearablePart(ch:FindFirstChild("Gemstone"))
+	if part then return part end
+	return findWearablePart(ch:FindFirstChild("PackedGemstone"))
+end
+
+-- aplica aparencia num no que pode ser MeshPart ou Part
+local function applyAppearance(node, info)
+	if not node then return false end
+	if node:IsA("MeshPart") then
+		if info.meshId and info.meshId ~= "" then
+			pcall(function() node.MeshId = info.meshId end)
+		end
+		if info.texture and info.texture ~= "" then
+			node.TextureID = info.texture
+			node.Color = Color3.fromRGB(255, 255, 255)
+		else
+			node.TextureID = ""
+			node.Color = info.color
+		end
+		node.Material = info.material
+		return true
+	elseif node:IsA("BasePart") then
+		node.Color = info.color
+		node.Material = info.material
+		local mesh = node:FindFirstChildOfClass("SpecialMesh")
+		if info.meshId and info.meshId ~= "" then
+			if not mesh then
+				mesh = Instance.new("SpecialMesh")
+				mesh.MeshType = Enum.MeshType.FileMesh
+				mesh.Parent = node
+			end
+			pcall(function() mesh.MeshId = info.meshId end)
+			if info.texture and info.texture ~= "" then
+				pcall(function() mesh.TextureId = info.texture end)
+			end
+		end
+		return true
 	end
-	return nil
+	return false
 end
 
 -- salva o visual original pra poder restaurar
@@ -3044,8 +3101,14 @@ local function rememberOriginal()
 	if not ch or Z.SkinOriginal then return end
 	local hm, gm = getHammerPart(), getGemPart()
 	Z.SkinOriginal = {
-		hammer = hm and { TextureID = hm.TextureID, Color = hm.Color, Material = hm.Material } or nil,
-		gem = gm and { TextureID = gm.TextureID, Color = gm.Color, Material = gm.Material } or nil,
+		hammer = hm and {
+			TextureID = (hm:IsA("MeshPart")) and hm.TextureID or "",
+			Color = hm.Color, Material = hm.Material,
+		} or nil,
+		gem = gm and {
+			TextureID = (gm:IsA("MeshPart")) and gm.TextureID or "",
+			Color = gm.Color, Material = gm.Material,
+		} or nil,
 	}
 end
 
@@ -3064,20 +3127,11 @@ function Core.ApplySkin(key, part)
 	if not target then
 		return false, isGem and "gema nao equipada" or "marreta nao equipada"
 	end
-	if not target:IsA("MeshPart") then
-		return false, "parte alvo nao e MeshPart"
-	end
 
-	if info.texture then
-		target.TextureID = info.texture
-		-- textura cobre a cor; deixa neutro pra nao tingir
-		target.Color = Color3.fromRGB(255, 255, 255)
-	else
-		-- sem textura: usa cor solida
-		target.TextureID = ""
-		target.Color = info.color
+	local ok = applyAppearance(target, info)
+	if not ok then
+		return false, "parte alvo incompativel (" .. target.ClassName .. ")"
 	end
-	target.Material = info.material
 
 	Z.SkinKey = key
 	Z.SkinName = info.name
@@ -3088,16 +3142,16 @@ function Core.RestoreSkin()
 	local ch = getChar()
 	if not ch or not Z.SkinOriginal then return false, "nada pra restaurar" end
 	local hm, gm = getHammerPart(), getGemPart()
-	if hm and Z.SkinOriginal.hammer then
-		hm.TextureID = Z.SkinOriginal.hammer.TextureID
-		hm.Color = Z.SkinOriginal.hammer.Color
-		hm.Material = Z.SkinOriginal.hammer.Material
+	local function restore(node, saved)
+		if not node or not saved then return end
+		if node:IsA("MeshPart") then
+			node.TextureID = saved.TextureID or ""
+		end
+		node.Color = saved.Color
+		node.Material = saved.Material
 	end
-	if gm and Z.SkinOriginal.gem then
-		gm.TextureID = Z.SkinOriginal.gem.TextureID
-		gm.Color = Z.SkinOriginal.gem.Color
-		gm.Material = Z.SkinOriginal.gem.Material
-	end
+	restore(hm, Z.SkinOriginal.hammer)
+	restore(gm, Z.SkinOriginal.gem)
 	Z.SkinKey = nil
 	Z.SkinName = nil
 	return true
