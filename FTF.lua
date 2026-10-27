@@ -2942,21 +2942,25 @@ local function readItem(m)
 	end
 
 	-- extrai aparencia de um Model do ItemDatabase.
-	-- ATENCAO: o no chamado "Handle" pode ser Part OU MeshPart conforme o item,
-	-- e o MeshPart real as vezes so existe em "Model". Por isso varre tudo.
+	-- ATENCAO 1: o no "Handle" pode ser Part OU MeshPart.
+	-- ATENCAO 2: itens COMPOSTOS (ex: Spring World, 26 MeshParts) usam varios
+	--            modelos pequenos empilhados. Aplicar so um deles na peca
+	--            2.8x4.2x1.3 do personagem deixa a marreta invisivel.
+	--            Por isso so reportamos meshId em itens de peca UNICA.
 	local function readAppearance(holder)
 		if not holder then return nil end
-		local mesh = nil       -- prefere MeshPart
-		local anyPart = nil    -- aceita Part comum
+		local meshList = {}
+		local anyPart = nil
 		local handleNode = nil
 		for _, c in ipairs(holder:GetDescendants()) do
 			if c:IsA("MeshPart") then
-				if mesh == nil then mesh = c end
+				table.insert(meshList, c)
 			elseif c:IsA("BasePart") then
 				if anyPart == nil then anyPart = c end
 			end
 			if c.Name == "Handle" and handleNode == nil then handleNode = c end
 		end
+		local mesh = meshList[1]
 		local node = mesh or handleNode or anyPart
 		if not node then return nil end
 		local tex = nil
@@ -2965,11 +2969,15 @@ local function readItem(m)
 		elseif node:IsA("Decal") then
 			if node.Texture ~= "" then tex = node.Texture end
 		end
+		-- so considera "peca unica" quando ha exatamente 1 MeshPart
+		local simple = (#meshList == 1)
 		return {
 			texture = tex,
 			color = node.Color,
 			material = node.Material,
-			meshId = (node:IsA("MeshPart")) and node.MeshId or nil,
+			meshId = (simple and mesh and mesh.MeshId ~= "") and mesh.MeshId or nil,
+			size = simple and mesh and mesh.Size or nil,
+			pieceCount = #meshList,
 			className = node.ClassName,
 		}
 	end
@@ -3063,8 +3071,16 @@ end
 local function applyAppearance(node, info)
 	if not node then return false end
 	if node:IsA("MeshPart") then
+		-- so troca mesh quando o item REALMENTE tem MeshPart.
+		-- trocar MeshId sem Size compativel deixa a peca invisivel.
 		if info.meshId and info.meshId ~= "" then
-			pcall(function() node.MeshId = info.meshId end)
+			local okMesh = pcall(function()
+				node.MeshId = info.meshId
+				if info.size then node.Size = info.size end
+			end)
+			if not okMesh then
+				return false, "falha ao trocar mesh"
+			end
 		end
 		if info.texture and info.texture ~= "" then
 			node.TextureID = info.texture
@@ -3080,13 +3096,6 @@ local function applyAppearance(node, info)
 		-- objeto "some". Peca comum so aceita cor/material.
 		node.Color = info.color
 		node.Material = info.material
-		local existing = node:FindFirstChildOfClass("SpecialMesh")
-		if existing and existing.MeshId ~= "" and info.meshId and info.meshId ~= "" then
-			pcall(function() existing.MeshId = info.meshId end)
-			if info.texture and info.texture ~= "" then
-				pcall(function() existing.TextureId = info.texture end)
-			end
-		end
 		return true
 	end
 	return false
@@ -3096,16 +3105,22 @@ end
 local function rememberOriginal()
 	local ch = getChar()
 	if not ch or Z.SkinOriginal then return end
-	local hm, gm = getHammerPart(), getGemPart()
+	local function snap(node)
+		if not node then return nil end
+		local d = {
+			TextureID = (node:IsA("MeshPart")) and node.TextureID or "",
+			Color = node.Color,
+			Material = node.Material,
+		}
+		if node:IsA("MeshPart") then
+			d.MeshId = node.MeshId
+			d.Size = node.Size
+		end
+		return d
+	end
 	Z.SkinOriginal = {
-		hammer = hm and {
-			TextureID = (hm:IsA("MeshPart")) and hm.TextureID or "",
-			Color = hm.Color, Material = hm.Material,
-		} or nil,
-		gem = gm and {
-			TextureID = (gm:IsA("MeshPart")) and gm.TextureID or "",
-			Color = gm.Color, Material = gm.Material,
-		} or nil,
+		hammer = snap(getHammerPart()),
+		gem = snap(getGemPart()),
 	}
 end
 
@@ -3148,6 +3163,12 @@ function Core.RestoreSkin()
 	local function restore(node, saved)
 		if not node or not saved then return end
 		if node:IsA("MeshPart") then
+			if saved.MeshId and saved.MeshId ~= "" then
+				pcall(function() node.MeshId = saved.MeshId end)
+			end
+			if saved.Size then
+				pcall(function() node.Size = saved.Size end)
+			end
 			node.TextureID = saved.TextureID or ""
 		else
 			-- limpa SpecialMesh vazio que versoes antigas possam ter injetado
