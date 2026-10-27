@@ -3076,18 +3076,15 @@ local function applyAppearance(node, info)
 		node.Material = info.material
 		return true
 	elseif node:IsA("BasePart") then
+		-- NUNCA injeta SpecialMesh aqui: numa peca sem MeshId ela colapsa e o
+		-- objeto "some". Peca comum so aceita cor/material.
 		node.Color = info.color
 		node.Material = info.material
-		local mesh = node:FindFirstChildOfClass("SpecialMesh")
-		if info.meshId and info.meshId ~= "" then
-			if not mesh then
-				mesh = Instance.new("SpecialMesh")
-				mesh.MeshType = Enum.MeshType.FileMesh
-				mesh.Parent = node
-			end
-			pcall(function() mesh.MeshId = info.meshId end)
+		local existing = node:FindFirstChildOfClass("SpecialMesh")
+		if existing and existing.MeshId ~= "" and info.meshId and info.meshId ~= "" then
+			pcall(function() existing.MeshId = info.meshId end)
 			if info.texture and info.texture ~= "" then
-				pcall(function() mesh.TextureId = info.texture end)
+				pcall(function() existing.TextureId = info.texture end)
 			end
 		end
 		return true
@@ -3135,6 +3132,12 @@ function Core.ApplySkin(key, part)
 
 	Z.SkinKey = key
 	Z.SkinName = info.name
+
+	-- se o item tem mesh propria e o alvo e peca comum, o formato NAO muda:
+	-- avisa em vez de fingir que aplicou
+	if info.meshId and info.meshId ~= "" and not target:IsA("MeshPart") then
+		return true, info.name .. " (cor/material apenas - alvo sem MeshPart)"
+	end
 	return true, info.name
 end
 
@@ -3146,6 +3149,10 @@ function Core.RestoreSkin()
 		if not node or not saved then return end
 		if node:IsA("MeshPart") then
 			node.TextureID = saved.TextureID or ""
+		else
+			-- limpa SpecialMesh vazio que versoes antigas possam ter injetado
+			local sm = node:FindFirstChildOfClass("SpecialMesh")
+			if sm and sm.MeshId == "" then sm:Destroy() end
 		end
 		node.Color = saved.Color
 		node.Material = saved.Material
